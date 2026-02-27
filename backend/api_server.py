@@ -16,45 +16,36 @@ import json
 from datetime import datetime
 import requests
 
-# Load environment variables
+# Load environment variables (.env file in the same directory)
 load_dotenv()
 
-# Dynamic import handling - works from both root and backend directories
-root_dir = Path(__file__).parent.parent
-if str(root_dir) not in sys.path:
-    sys.path.insert(0, str(root_dir))
+# Add the backend directory itself to sys.path so all local modules are
+# importable regardless of the working directory Railway sets at runtime.
+_backend_dir = Path(__file__).parent
+if str(_backend_dir) not in sys.path:
+    sys.path.insert(0, str(_backend_dir))
 
-# Import local services
-try:
-    from database import ParseHubDatabase
-    from monitoring_service import MonitoringService
-    from analytics_service import AnalyticsService
-    from excel_import_service import ExcelImportService
-    from auto_runner_service import AutoRunnerService
-    from fetch_projects import fetch_all_projects, get_all_projects_with_cache
-    from incremental_scraping_scheduler import start_incremental_scraping_scheduler, stop_incremental_scraping_scheduler
-    from auto_sync_service import start_auto_sync_service, stop_auto_sync_service, get_auto_sync_service
-except ImportError:
-    # Fallback for when running from backend directory
-    from database import ParseHubDatabase
-    from monitoring_service import MonitoringService
-    from analytics_service import AnalyticsService
-    from excel_import_service import ExcelImportService
-    from auto_runner_service import AutoRunnerService
-    from fetch_projects import fetch_all_projects, get_all_projects_with_cache
-    from incremental_scraping_scheduler import start_incremental_scraping_scheduler, stop_incremental_scraping_scheduler
-    from auto_sync_service import start_auto_sync_service, stop_auto_sync_service, get_auto_sync_service
+# Import local services — straightforward single-attempt import.
+# The old try/except "fallback" re-imported the identical names and would
+# simply re-raise any ImportError, hiding the real missing module.
+from database import ParseHubDatabase
+from monitoring_service import MonitoringService
+from analytics_service import AnalyticsService
+from excel_import_service import ExcelImportService
+from auto_runner_service import AutoRunnerService
+from fetch_projects import fetch_all_projects, get_all_projects_with_cache
+from incremental_scraping_scheduler import start_incremental_scraping_scheduler, stop_incremental_scraping_scheduler
+from auto_sync_service import start_auto_sync_service, stop_auto_sync_service, get_auto_sync_service
 
 # Initialize Flask app
 app = Flask(__name__)
 
-CORS(
-    app,
-    resources={r"/api/*": {
-        "origins": ["https://pi-parsehub-monitor.up.railway.app"]
-    }},
-    supports_credentials=True
-)
+# All calls to this backend come from the Next.js server (server-to-server),
+# never directly from a browser.  Server-side requests carry no Origin header,
+# so Flask-CORS is effectively a no-op here — but we still configure it
+# permissively so Railway health checks and any future direct-call use case
+# never get a CORS rejection.
+CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=False)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)

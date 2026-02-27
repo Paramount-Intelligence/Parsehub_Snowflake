@@ -1,0 +1,11 @@
+# Nixpacks build configuration for the Flask backend.
+# Forces Python 3.11 and installs the libpq C library needed by psycopg2-binary.
+
+[phases.setup]
+nixPkgs = ["python311", "libpq", "gcc"]
+
+[phases.install]
+cmds = ["pip install --upgrade pip", "pip install -r requirements.txt"]
+
+[start]
+cmd = "gunicorn api_server:app --workers 2 --threads 2 --worker-class gthread --timeout 120 --keep-alive 5 --bind 0.0.0.0:$PORT --log-level info --access-logfile - --error-logfile -"
