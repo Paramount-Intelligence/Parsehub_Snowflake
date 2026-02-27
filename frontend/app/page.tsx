@@ -11,6 +11,8 @@ import {
   Play,
   Filter,
   X,
+  RefreshCw,
+  WifiOff,
 } from "lucide-react";
 import ProjectsList from "@/components/ProjectsList";
 import StatsCard from "@/components/StatsCard";
@@ -20,6 +22,35 @@ import apiClient from "@/lib/apiClient";
 
 import RunDialog from "@/components/RunDialog";
 import { useRealTimeMonitoring } from "@/lib/useRealTimeMonitoring";
+
+/**
+ * Extract a human-readable message from anything that can be thrown.
+ * apiClient rejects with a plain object { message, status, data, ... }
+ * (not an Error instance), so we must check .message before String().
+ */
+function extractErrorMessage(err: unknown): string {
+  if (!err) return "An unexpected error occurred.";
+  if (err instanceof Error) return err.message;
+  if (typeof err === "object") {
+    const e = err as Record<string, unknown>;
+    if (typeof e.message === "string" && e.message) return e.message;
+    if (typeof e.error === "string" && e.error) return e.error;
+  }
+  return "An unexpected error occurred. Please try again.";
+}
+
+/** True when the error is almost certainly a 502/503 from a cold backend. */
+function isBackendDown(err: unknown): boolean {
+  const msg = extractErrorMessage(err).toLowerCase();
+  return (
+    msg.includes("502") ||
+    msg.includes("503") ||
+    msg.includes("unreachable") ||
+    msg.includes("failed to fetch") ||
+    msg.includes("network error") ||
+    msg.includes("backend")
+  );
+}
 
 interface Project {
   token: string;
@@ -52,6 +83,7 @@ export default function Home() {
   });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [backendDown, setBackendDown] = useState(false);
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
   const [analyticsOpen, setAnalyticsOpen] = useState(false);
   const [runDialogOpen, setRunDialogOpen] = useState(false);
@@ -114,7 +146,7 @@ export default function Home() {
         );
       }
     } catch (err) {
-      console.error("[Home] Error fetching filter options:", err);
+      console.error("[Home] Error fetching filter options:", extractErrorMessage(err));
     }
   };
 
@@ -132,7 +164,7 @@ export default function Home() {
         "metadata records",
       );
     } catch (err) {
-      console.error("[Home] Error fetching metadata:", err);
+      console.error("[Home] Error fetching metadata:", extractErrorMessage(err));
     }
   };
 
@@ -213,6 +245,7 @@ export default function Home() {
 
       setProjects(allProjects);
       setLastUpdate(new Date());
+      setBackendDown(false);
 
       // Calculate stats
       const running =
@@ -234,9 +267,10 @@ export default function Home() {
 
       setLoading(false);
     } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      console.error("[Home] Error:", errorMsg);
+      const errorMsg = extractErrorMessage(err);
+      console.error("[Home] Error fetching projects:", errorMsg);
       setError(errorMsg);
+      setBackendDown(isBackendDown(err));
       setLoading(false);
     }
   };
@@ -264,7 +298,7 @@ export default function Home() {
         setSyncing(false);
       }, 1000);
     } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
+      const errorMsg = extractErrorMessage(err);
       console.error("[Home] Sync error:", errorMsg);
       setError(errorMsg);
       setSyncing(false);
@@ -278,7 +312,7 @@ export default function Home() {
       setTimeout(fetchProjects, 1000);
 
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to run projects");
+      setError(extractErrorMessage(err));
     }
   };
 
@@ -296,26 +330,54 @@ export default function Home() {
     <main className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950">
       <Header />
 
-      {/* Error Alert */}
+      {/* Error / Backend-down banner */}
       {error && (
         <div className="container mx-auto px-6 py-4 mt-6">
-          <div className="bg-red-900/30 backdrop-blur-sm border border-red-700/50 rounded-xl p-4 flex items-start gap-3 shadow-lg shadow-red-900/20">
-            <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" />
-            <div className="flex-1">
-              <p className="font-semibold text-red-300">
-                {error.toLowerCase().includes('unreachable') ? 'Backend Unreachable' : 'Error'}
-              </p>
-              <p className="text-red-400 text-sm mt-0.5">{error}</p>
+          {backendDown ? (
+            /* Full-bleed backend-down card with instructions */
+            <div className="bg-amber-900/20 backdrop-blur-sm border border-amber-700/40 rounded-xl p-6 shadow-lg shadow-amber-900/10">
+              <div className="flex items-start gap-4">
+                <WifiOff className="w-6 h-6 text-amber-400 flex-shrink-0 mt-0.5" />
+                <div className="flex-1 min-w-0">
+                  <p className="font-semibold text-amber-200 text-base">
+                    Backend is unreachable
+                  </p>
+                  <p className="text-amber-400/90 text-sm mt-1 leading-relaxed">
+                    The Flask API server is not responding (502/503). This usually means
+                    the backend service is still <strong>starting up on Railway</strong> or
+                    the <code className="px-1 py-0.5 bg-amber-900/50 rounded text-xs">BACKEND_API_URL</code> environment
+                    variable is not set on the frontend service.
+                  </p>
+                  <p className="text-amber-500 text-xs mt-2">
+                    Detail: <span className="font-mono">{error}</span>
+                  </p>
+                </div>
+                <button
+                  onClick={() => { setError(null); setBackendDown(false); fetchProjects(); }}
+                  className="flex-shrink-0 flex items-center gap-2 px-4 py-2 bg-amber-700 hover:bg-amber-600 text-white text-sm font-medium rounded-lg transition-colors"
+                >
+                  <RefreshCw className="w-4 h-4" />
+                  Retry
+                </button>
+              </div>
             </div>
-            {error.toLowerCase().includes('unreachable') && (
+          ) : (
+            /* Standard error banner */
+            <div className="bg-red-900/30 backdrop-blur-sm border border-red-700/50 rounded-xl p-4 flex items-start gap-3 shadow-lg shadow-red-900/20">
+              <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" />
+              <div className="flex-1 min-w-0">
+                <p className="font-semibold text-red-300">Error</p>
+                <p className="text-red-400 text-sm mt-0.5 break-words">{error}</p>
+              </div>
               <button
-                onClick={fetchProjects}
-                className="px-4 py-1.5 bg-red-800 hover:bg-red-700 text-white text-sm font-medium rounded-lg transition-colors"
+                onClick={() => { setError(null); fetchProjects(); }}
+                className="flex-shrink-0 flex items-center gap-2 px-4 py-1.5 bg-red-800 hover:bg-red-700 text-white text-sm font-medium rounded-lg transition-colors"
               >
+                <RefreshCw className="w-3.5 h-3.5" />
                 Retry
               </button>
-            )}
-          </div>
+            </div>
+          )}
         </div>
       )}
 
