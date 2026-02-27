@@ -2824,6 +2824,68 @@ class ParseHubDatabase:
             print(f"Error getting project by token {token}: {e}")
             return None
 
+    def get_project_by_id(self, project_id: int) -> dict:
+        """
+        Get a specific project by numeric ID.
+        Returns project data with last run info from database, or None if not found.
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+
+            query = '''
+                SELECT id, token, title, owner_email, main_site, created_at, updated_at
+                FROM projects
+                WHERE id = ?
+            '''
+            cursor.execute(query, (project_id,))
+            row = cursor.fetchone()
+
+            if not row:
+                conn.close()
+                return None
+
+            project = {
+                'id': row[0],
+                'token': row[1],
+                'title': row[2],
+                'owner_email': row[3],
+                'main_site': row[4],
+                'created_at': row[5],
+                'updated_at': row[6],
+                'last_run': None
+            }
+
+            run_query = '''
+                SELECT run_token, status, pages_scraped, start_time, end_time,
+                       duration_seconds, created_at, updated_at
+                FROM runs
+                WHERE project_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+            '''
+            cursor.execute(run_query, (project_id,))
+            run_row = cursor.fetchone()
+
+            if run_row:
+                project['last_run'] = {
+                    'run_token': run_row[0],
+                    'status': run_row[1],
+                    'pages_scraped': run_row[2] or 0,
+                    'pages': run_row[2] or 0,
+                    'start_time': run_row[3],
+                    'end_time': run_row[4],
+                    'duration_seconds': run_row[5],
+                    'created_at': run_row[6],
+                    'updated_at': run_row[7]
+                }
+
+            conn.close()
+            return project
+        except Exception as e:
+            print(f"Error getting project by id {project_id}: {e}")
+            return None
+
     def get_project_id_by_token(self, token: str) -> int:
         """
         Get project ID by project token

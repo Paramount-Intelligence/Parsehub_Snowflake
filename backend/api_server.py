@@ -1227,10 +1227,29 @@ def get_filters():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/projects/<int:project_id>', methods=['GET'])
+def get_project_by_id(project_id: int):
+    """
+    Get a single project by numeric ID.
+    Returns 404 with { "error": "Project not found" } if not found.
+    """
+    if not validate_api_key(request):
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    try:
+        project = g.db.get_project_by_id(project_id)
+        if not project:
+            return jsonify({'error': 'Project not found'}), 404
+        return jsonify({'success': True, 'data': project}), 200
+    except Exception as e:
+        logger.error(f'[API] Error getting project by id {project_id}: {e}')
+        return jsonify({'error': str(e), 'success': False}), 500
+
+
 @app.route('/api/projects/<token>', methods=['GET'])
 def get_project_details(token: str):
     """
-    Get detailed information about a specific project
+    Get detailed information about a specific project (by token)
     Includes project data, associated metadata, and run statistics
     """
     try:
