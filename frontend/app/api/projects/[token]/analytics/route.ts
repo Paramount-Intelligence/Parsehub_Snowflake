@@ -1,6 +1,7 @@
+import { getApiBaseUrl } from "@/lib/apiBase";
 import { NextRequest, NextResponse } from 'next/server'
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000'
+const BACKEND_URL = getApiBaseUrl();
 const API_KEY = process.env.NEXT_PUBLIC_API_KEY || 't_hmXetfMCq3'
 
 export async function GET(

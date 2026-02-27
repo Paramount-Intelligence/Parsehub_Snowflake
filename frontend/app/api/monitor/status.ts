@@ -1,3 +1,4 @@
+import { getApiBaseUrl } from "@/lib/apiBase";
 import { NextRequest, NextResponse } from 'next/server';
 
 export async function GET(request: NextRequest) {
@@ -14,7 +15,7 @@ export async function GET(request: NextRequest) {
     }
 
     // Call Python backend API to get monitoring status
-    const backendUrl = process.env.BACKEND_API_URL || 'http://localhost:5000';
+    const backendUrl = getApiBaseUrl();
     
     const params = new URLSearchParams();
     if (projectId) params.append('project_id', projectId);

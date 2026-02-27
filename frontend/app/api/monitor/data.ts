@@ -1,3 +1,4 @@
+import { getApiBaseUrl } from "@/lib/apiBase";
 import { NextRequest, NextResponse } from 'next/server';
 
 export async function GET(request: NextRequest) {
@@ -15,7 +16,7 @@ export async function GET(request: NextRequest) {
     }
 
     // Call Python backend API to get session records
-    const backendUrl = process.env.BACKEND_API_URL || 'http://localhost:5000';
+    const backendUrl = getApiBaseUrl();
     
     const params = new URLSearchParams();
     params.append('session_id', sessionId);

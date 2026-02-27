@@ -1,3 +1,4 @@
+import { getApiBaseUrl } from "@/lib/apiBase";
 import { NextRequest, NextResponse } from 'next/server';
 
 export async function POST(request: NextRequest) {
@@ -12,7 +13,7 @@ export async function POST(request: NextRequest) {
     }
 
     // Call Python backend API to stop monitoring
-    const backendUrl = process.env.BACKEND_API_URL || 'http://localhost:5000';
+    const backendUrl = getApiBaseUrl();
     
     const response = await fetch(`${backendUrl}/api/monitor/stop`, {
       method: 'POST',

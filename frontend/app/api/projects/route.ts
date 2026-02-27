@@ -1,7 +1,8 @@
+import { getApiBaseUrl } from "@/lib/apiBase";
 import { NextResponse, NextRequest } from 'next/server'
 import axios from 'axios'
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000'
+const BACKEND_URL = getApiBaseUrl();
 const BACKEND_API_KEY = process.env.BACKEND_API_KEY || 't_hmXetfMCq3'
 const REQUEST_TIMEOUT = 30000 // 30 seconds for paginated requests (NOT 300 seconds!)
 

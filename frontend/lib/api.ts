@@ -1,4 +1,5 @@
-export const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000'
+import { getFrontendApiUrl } from "./apiBase";
+export const API_URL = getFrontendApiUrl();
 
 export async function fetchProjects() {
   const response = await fetch(`${API_URL}/api/projects`)

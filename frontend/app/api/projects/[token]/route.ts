@@ -1,9 +1,10 @@
+import { getApiBaseUrl } from "@/lib/apiBase";
 import { NextRequest, NextResponse } from 'next/server'
 import axios from 'axios'
 
 const API_KEY = process.env.PARSEHUB_API_KEY || ''
 const BASE_URL = process.env.PARSEHUB_BASE_URL || 'https://www.parsehub.com/api/v2'
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000'
+const BACKEND_URL = getApiBaseUrl();
 
 export async function GET(
   _request: NextRequest,
