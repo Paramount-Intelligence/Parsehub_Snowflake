@@ -47,30 +47,13 @@ except ImportError:
 # Initialize Flask app
 app = Flask(__name__)
 
-# ── CORS Configuration ──────────────────────────────────────────────────────
-# Allow only the deployed frontend(s). In development, also allow localhost.
-# ALLOWED_ORIGINS env var can be comma-separated for multiple frontends.
-_raw_origins = os.getenv(
-    "ALLOWED_ORIGINS",
-    "https://pi-parsehub-monitor.up.railway.app,http://localhost:3000"
-)
-ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
-
 CORS(
     app,
-    origins=ALLOWED_ORIGINS,           # Explicit allow-list; no wildcard
-    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=[
-        "Content-Type",
-        "Authorization",
-        "X-Requested-With",
-        "Accept",
-    ],
-    supports_credentials=True,          # Needed for Bearer token in Authorization header
-    max_age=3600,                        # Cache preflight for 1 h
-    resources=r"/api/*",                 # Only scope CORS to API routes
+    resources={r"/api/*": {
+        "origins": ["https://pi-parsehub-monitor.up.railway.app"]
+    }},
+    supports_credentials=True
 )
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 # Configure logging
