@@ -155,28 +155,15 @@ def return_db_connection(exc=None):
     except Exception as e:
         logger.warning(f'[teardown] Error returning DB connection: {e}')
 
-# ── Health Blueprint ─────────────────────────────────────────────────────────────
-# Rules that eliminate AssertionError on startup:
-#   1. Routes live in a Blueprint (not on `app` directly).
-#   2. Every @route decorator has an explicit `endpoint=` argument.
-#   3. The Python function names are unique across the whole file
-#      (health_liveness_route / health_db_route) — Flask cannot use them as
-#      accidental default endpoint names.
-#   4. register_blueprint is called exactly once at module level.
-
-from flask import Blueprint as _Blueprint
-
-_health_bp = _Blueprint('health', __name__)
-
-
-@_health_bp.route('/api/health', methods=['GET'], endpoint='liveness')
-def health_liveness_route():
-    """Lightweight liveness probe — never touches the database."""
+# ── Health (single definition each — no Blueprint, no duplicate endpoint) ─────────
+@app.route('/api/health', methods=['GET'], endpoint='health_liveness')
+def health_check():
+    """Liveness probe — never touches the database. Defined exactly once."""
     return jsonify({'status': 'ok', 'service': 'parsehub-backend'}), 200
 
 
-@_health_bp.route('/api/health/db', methods=['GET'], endpoint='readiness')
-def health_db_route():
+@app.route('/api/health/db', methods=['GET'], endpoint='health_readiness')
+def health_check_db():
     """Readiness probe — verifies database connectivity."""
     try:
         from db_pool import ping_db
@@ -186,11 +173,6 @@ def health_db_route():
         return jsonify({'status': 'error', 'database': 'unreachable'}), 503
     except Exception as exc:
         return jsonify({'status': 'error', 'detail': str(exc)}), 503
-
-
-# Register exactly once — guard prevents double-registration on hot reloads
-if 'health' not in app.blueprints:
-    app.register_blueprint(_health_bp)
 
 
 # ── Background services ───────────────────────────────────────────────────────────
@@ -1839,8 +1821,6 @@ def get_incomplete_projects():
     except Exception as e:
         logger.error(f'Error getting incomplete projects: {e}')
         return jsonify({'error': str(e)}), 500
-
-# (Health endpoints moved to _health_bp Blueprint above, around line 122)
 
 # ========== ERROR HANDLERS ==========
 
