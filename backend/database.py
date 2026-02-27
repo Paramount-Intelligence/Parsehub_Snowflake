@@ -37,10 +37,10 @@ class ParseHubDatabase:
     _shared_local = threading.local()
 
     def __init__(self, db_path: str = None):
-        # Database connection info
+        # Database connection info — never open a connection here.
+        # Connections are obtained lazily per-request from the pool (db_pool.py).
         self.db_url = os.getenv('DATABASE_URL')
         self.use_postgres = bool(self.db_url and POSTGRES_AVAILABLE)
-        
 
         if self.use_postgres:
             print(f"Using PostgreSQL database: {self.db_url.split('@')[-1]}")
@@ -55,8 +55,9 @@ class ParseHubDatabase:
             self.db_path = db_path
             print(f"Using SQLite database: {self.db_path}")
 
-        self.conn = None
-        self.init_db()
+        # NOTE: No self.conn = None; no self.init_db() here.
+        # Connections are managed by db_pool.ConnectionPool for PostgreSQL
+        # and by thread-local storage for SQLite (legacy mode).
 
     @property
     def conn(self):
@@ -173,35 +174,77 @@ class ParseHubDatabase:
 
 
     def connect(self):
-        """Connect to or return existing database connection"""
-        if getattr(self._shared_local, 'conn', None):
-            # Test if connection is alive
-            try:
-                if self.use_postgres:
-                    # Quick ping for Postgres
-                    cursor = getattr(self._shared_local, 'conn').cursor()
-                    cursor.execute("SELECT 1")
-                    # psycopg2 might need explicitly calling commit or closing cursor
-                    if hasattr(cursor, 'close'): cursor.close()
-                return getattr(self._shared_local, 'conn')
-            except Exception:
-                # Connection is dead
+        """Connect to or return existing database connection.
+        
+        For PostgreSQL → borrow from the module-level connection pool.
+        For SQLite     → use a thread-local connection (unchanged behaviour).
+        """
+        if self.use_postgres:
+            # Borrow from pool; caller is responsible for returning it.
+            # For backwards compatibility we also cache it on the thread local
+            # so that cursor() works without needing `with get_db_connection()`.
+            if not getattr(self._shared_local, 'conn', None):
                 try:
-                    getattr(self._shared_local, 'conn').close()
+                    from db_pool import get_pool
+                    pool = get_pool()
+                    self._shared_local.conn = pool.get()
+                    self._shared_local._pool_ref = pool  # keep ref for return
+                except Exception as exc:
+                    raise RuntimeError(f'[DB] Cannot obtain PostgreSQL connection: {exc}') from exc
+            else:
+                # Test if still alive
+                try:
+                    cur = self._shared_local.conn.cursor()
+                    cur.execute('SELECT 1')
+                except Exception:
+                    # Return dead connection, get a fresh one
+                    try:
+                        self._shared_local._pool_ref.put(
+                            self._shared_local.conn, broken=True
+                        )
+                    except Exception:
+                        pass
+                    self._shared_local.conn = None
+                    try:
+                        from db_pool import get_pool
+                        pool = get_pool()
+                        self._shared_local.conn = pool.get()
+                        self._shared_local._pool_ref = pool
+                    except Exception as exc:
+                        raise RuntimeError(f'[DB] Cannot replace stale connection: {exc}') from exc
+            return self._shared_local.conn
+
+        # SQLite — unchanged thread-local behaviour
+        if getattr(self._shared_local, 'conn', None):
+            try:
+                self._shared_local.conn.execute('SELECT 1')
+                return self._shared_local.conn
+            except Exception:
+                try:
+                    self._shared_local.conn.close()
                 except Exception:
                     pass
                 self._shared_local.conn = None
-                
-        # Create new connection
+
         self.conn = self._get_connection()
         return self.conn
 
 
     def disconnect(self):
-        """Close database connection"""
-        # We now keep the connection alive per-thread to prevent connection leaks
-        # and limit the total number of connections to the number of workers.
-        pass
+        """Return the PostgreSQL connection to the pool, or close SQLite connection."""
+        if self.use_postgres:
+            conn = getattr(self._shared_local, 'conn', None)
+            pool = getattr(self._shared_local, '_pool_ref', None)
+            if conn and pool:
+                try:
+                    pool.put(conn)
+                except Exception:
+                    pass
+            self._shared_local.conn = None
+            self._shared_local._pool_ref = None
+        else:
+            # SQLite: keep thread-local alive for the lifetime of the worker thread
+            pass
 
     def init_db(self):
         """Initialize database schema"""

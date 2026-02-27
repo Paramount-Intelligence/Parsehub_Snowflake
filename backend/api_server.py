@@ -55,40 +55,114 @@ CORS(
     supports_credentials=True
 )
 
-
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize services
-db = ParseHubDatabase()
-monitoring_service = MonitoringService()
-analytics_service = AnalyticsService()
-excel_import_service = ExcelImportService(db)
-auto_runner_service = AutoRunnerService()
+# ── Service registry ─────────────────────────────────────────────────────────────
+# Services are created ONCE after the module finishes loading.
+# No DB connection is opened at import time (fixes "too many clients").
+_db = None
+_monitoring_service = None
+_analytics_service = None
+_excel_import_service = None
+_auto_runner_service = None
+_services_initialized = False
+_services_lock = __import__('threading').Lock()
 
-# Start background services for production/gunicorn
-def start_background_services():
+
+def get_db() -> 'ParseHubDatabase':
+    """Return the module-level DB helper (no connection opened yet)."""
+    global _db
+    if _db is None:
+        _db = ParseHubDatabase()   # __init__ no longer opens a connection
+    return _db
+
+
+def _initialize_services():
+    """Initialize all services exactly once per worker process."""
+    global _db, _monitoring_service, _analytics_service
+    global _excel_import_service, _auto_runner_service, _services_initialized
+
+    with _services_lock:
+        if _services_initialized:
+            return
+        try:
+            _db = ParseHubDatabase()           # metadata only, no connection
+
+            # Run schema init (opens + closes a connection immediately)
+            _db.init_db()
+
+            _monitoring_service   = MonitoringService()
+            _analytics_service    = AnalyticsService()
+            _excel_import_service = ExcelImportService(_db)
+            _auto_runner_service  = AutoRunnerService()
+
+            _services_initialized = True
+            logger.info('[boot] All services initialized.')
+            _start_background_services()
+        except Exception as exc:
+            logger.critical(f'[boot] Service initialization failed: {exc}')
+            # Do NOT crash — health endpoint still needs to work
+
+
+@app.before_request
+def ensure_services():
+    """Lazily initialize services on the very first real request."""
+    if not _services_initialized:
+        _initialize_services()
+
+
+@app.teardown_appcontext
+def return_db_connection(exc=None):
+    """Return the PostgreSQL connection to the pool after every request."""
+    db = _db
+    if db is not None and db.use_postgres:
+        db.disconnect()   # puts conn back in pool
+
+
+# ── Health endpoints ────────────────────────────────────────────────────────────
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Lightweight liveness probe — never touches the database."""
+    return jsonify({'status': 'ok', 'service': 'parsehub-backend'}), 200
+
+
+@app.route('/api/health/db', methods=['GET'])
+def health_check_db():
+    """Readiness probe — verifies database connectivity."""
     try:
-        check_interval = int(os.getenv('INCREMENTAL_SCRAPING_INTERVAL', 30))
-        sync_interval = int(os.getenv('AUTO_SYNC_INTERVAL', 5))
-        
-        logger.info(f"Background services starting: Scraper every {check_interval}m, Sync every {sync_interval}m")
-        
-        # Check if already started
+        from db_pool import ping_db
+        ok = ping_db()
+        if ok:
+            return jsonify({'status': 'ok', 'database': 'reachable'}), 200
+        return jsonify({'status': 'error', 'database': 'unreachable'}), 503
+    except Exception as exc:
+        return jsonify({'status': 'error', 'detail': str(exc)}), 503
+
+
+# ── Background services ───────────────────────────────────────────────────────────
+# Started inside _initialize_services() → once per worker, after DB is ready.
+
+def _start_background_services():
+    """Start background scheduler services (called inside _initialize_services)."""
+    try:
+        check_interval = int(os.getenv('INCREMENTAL_SCRAPING_INTERVAL', '30'))
+        sync_interval  = int(os.getenv('AUTO_SYNC_INTERVAL', '5'))
+        logger.info(
+            f'[bg] Starting background services: scraper={check_interval}m, sync={sync_interval}m'
+        )
         if get_auto_sync_service() is None:
             start_incremental_scraping_scheduler(check_interval)
             start_auto_sync_service(sync_interval)
-            logger.info("Background services successfully started")
-    except Exception as e:
-        logger.error(f"Failed to start background services: {e}")
+            logger.info('[bg] Background services started.')
+    except Exception as exc:
+        logger.error(f'[bg] Failed to start background services: {exc}')
 
-# Call immediately so it runs when imported by gunicorn
-start_background_services()
 
 # API Key validation
 BACKEND_API_KEY = os.getenv('BACKEND_API_KEY', 't_hmXetfMCq3')
-
 
 
 def validate_api_key(request_obj):
