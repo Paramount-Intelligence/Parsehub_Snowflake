@@ -817,7 +817,7 @@ export default function ProjectDetailsPage() {
                         Total Pages
                       </label>
                       <p className="text-2xl font-bold text-cyan-400">
-                        {metadata.total_pages.toLocaleString()}
+                        {(metadata.total_pages ?? 0).toLocaleString()}
                       </p>
                     </div>
                   )}
@@ -866,7 +866,7 @@ export default function ProjectDetailsPage() {
                         Total Products
                       </label>
                       <p className="text-2xl font-bold text-emerald-400">
-                        {metadata.total_products.toLocaleString()}
+                        {(metadata.total_products ?? 0).toLocaleString()}
                       </p>
                     </div>
                   )}
@@ -941,7 +941,7 @@ export default function ProjectDetailsPage() {
                         Last Run Date
                       </label>
                       <p className="text-slate-200">
-                        {new Date(metadata.last_run_date).toLocaleString()}
+                        {metadata.last_run_date ? new Date(metadata.last_run_date).toLocaleString() : "—"}
                       </p>
                     </div>
                   )}
@@ -988,7 +988,7 @@ export default function ProjectDetailsPage() {
                     </label>
                     <p className="text-slate-200">
                       {project.last_run.start_time
-                        ? new Date(project.last_run.start_time).toLocaleString()
+                        ? (project.last_run.start_time ? new Date(project.last_run.start_time).toLocaleString() : "—")
                         : "—"}
                     </p>
                   </div>
@@ -999,7 +999,7 @@ export default function ProjectDetailsPage() {
                         Ended
                       </label>
                       <p className="text-slate-200">
-                        {new Date(project.last_run.end_time).toLocaleString()}
+                        {project.last_run.end_time ? new Date(project.last_run.end_time).toLocaleString() : "—"}
                       </p>
                     </div>
                   )}
@@ -1035,7 +1035,7 @@ export default function ProjectDetailsPage() {
                         Total Products
                       </p>
                       <p className="text-3xl font-bold text-white">
-                        {productStats.statistics.total_products.toLocaleString()}
+                        {(productStats.statistics.total_products ?? 0).toLocaleString()}
                       </p>
                     </div>
 
@@ -1187,8 +1187,8 @@ export default function ProjectDetailsPage() {
 
             {/* Data Quality & Recovery Status */}
             {analytics &&
-              (analytics.data_quality.total_fields > 0 ||
-                analytics.recovery.total_recovery_attempts > 0) && (
+              ((analytics.data_quality?.total_fields ?? 0) > 0 ||
+                (analytics.recovery?.total_recovery_attempts ?? 0) > 0) && (
                 <div className="bg-slate-800/30 backdrop-blur-sm border border-slate-700/50 rounded-xl p-6">
                   <h2 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
                     <CheckCircle2 className="w-5 h-5 text-emerald-400" />
@@ -1197,7 +1197,7 @@ export default function ProjectDetailsPage() {
 
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                     {/* Data Quality */}
-                    {analytics.data_quality.total_fields > 0 && (
+                    {(analytics.data_quality?.total_fields ?? 0) > 0 && (
                       <div className="bg-emerald-500/10 rounded-lg p-4 border border-emerald-500/30">
                         <p className="text-xs font-semibold text-emerald-400 uppercase mb-2">
                           Data Quality
@@ -1205,32 +1205,32 @@ export default function ProjectDetailsPage() {
                         <p className="text-3xl font-bold text-white mb-1">
                           {Math.round(
                             analytics.data_quality
-                              .average_completion_percentage,
+                              ?.average_completion_percentage ?? 0,
                           )}
                           %
                         </p>
                         <p className="text-xs text-slate-400">
                           Average completion across{" "}
-                          {analytics.data_quality.total_fields} fields
+                          {analytics.data_quality?.total_fields ?? 0} fields
                         </p>
                       </div>
                     )}
 
                     {/* Recovery Status */}
-                    {analytics.recovery.total_recovery_attempts > 0 && (
+                    {(analytics.recovery?.total_recovery_attempts ?? 0) > 0 && (
                       <div
-                        className={`${analytics.recovery.in_recovery ? "bg-amber-500/10 border-amber-500/30" : "bg-blue-500/10 border-blue-500/30"} rounded-lg p-4 border`}
+                        className={`${analytics.recovery?.in_recovery ? "bg-amber-500/10 border-amber-500/30" : "bg-blue-500/10 border-blue-500/30"} rounded-lg p-4 border`}
                       >
                         <p
-                          className={`text-xs font-semibold uppercase mb-2 ${analytics.recovery.in_recovery ? "text-amber-400" : "text-blue-400"}`}
+                          className={`text-xs font-semibold uppercase mb-2 ${analytics.recovery?.in_recovery ? "text-amber-400" : "text-blue-400"}`}
                         >
                           Recovery Status
                         </p>
                         <p className="text-2xl font-bold text-white mb-1 capitalize">
-                          {analytics.recovery.status.replace("_", " ")}
+                          {(analytics.recovery?.status ?? "").replace("_", " ")}
                         </p>
                         <p className="text-xs text-slate-400">
-                          {analytics.recovery.total_recovery_attempts} recovery
+                          {analytics.recovery?.total_recovery_attempts ?? 0} recovery
                           attempt(s)
                         </p>
                       </div>
@@ -1256,7 +1256,7 @@ export default function ProjectDetailsPage() {
                       Total Products
                     </p>
                     <p className="text-2xl font-bold text-white">
-                      {productStats.statistics.total_products.toLocaleString()}
+                      {(productStats.statistics.total_products ?? 0).toLocaleString()}
                     </p>
                   </div>
                   <div>
@@ -1311,7 +1311,7 @@ export default function ProjectDetailsPage() {
             </div>
 
             {/* Advanced Analytics */}
-            {analytics && analytics.overview.total_runs > 0 && (
+            {analytics?.overview && analytics.overview.total_runs > 0 && (
               <div className="bg-gradient-to-br from-cyan-500/10 to-cyan-500/5 border border-cyan-500/30 rounded-xl p-5">
                 <h3 className="text-sm font-semibold text-cyan-400 mb-4 flex items-center gap-2">
                   <TrendingUp className="w-4 h-4" />
@@ -1322,7 +1322,7 @@ export default function ProjectDetailsPage() {
                   <div>
                     <p className="text-xs text-slate-400 mb-1">Total Records</p>
                     <p className="text-2xl font-bold text-white">
-                      {analytics.overview.total_records_scraped.toLocaleString()}
+                      {(analytics.overview.total_records_scraped ?? 0).toLocaleString()}
                     </p>
                   </div>
                   <div>
@@ -1339,7 +1339,7 @@ export default function ProjectDetailsPage() {
                       Pages Analyzed
                     </p>
                     <p className="text-2xl font-bold text-cyan-400">
-                      {analytics.overview.total_pages_analyzed.toLocaleString()}
+                      {(analytics.overview.total_pages_analyzed ?? 0).toLocaleString()}
                     </p>
                   </div>
                   {analytics.overview.progress_percentage > 0 && (
@@ -1365,7 +1365,7 @@ export default function ProjectDetailsPage() {
             )}
 
             {/* Performance Metrics */}
-            {analytics && analytics.performance.items_per_minute > 0 && (
+            {analytics?.performance && analytics.performance.items_per_minute > 0 && (
               <div className="bg-gradient-to-br from-amber-500/10 to-amber-500/5 border border-amber-500/30 rounded-xl p-5">
                 <h3 className="text-sm font-semibold text-amber-400 mb-4 flex items-center gap-2">
                   <Clock className="w-4 h-4" />
@@ -1376,14 +1376,14 @@ export default function ProjectDetailsPage() {
                   <div>
                     <p className="text-xs text-slate-400 mb-1">Items/Minute</p>
                     <p className="text-2xl font-bold text-white">
-                      {analytics.performance.items_per_minute.toFixed(2)}
+                      {(analytics.performance.items_per_minute ?? 0).toFixed(2)}
                     </p>
                   </div>
                   <div>
                     <p className="text-xs text-slate-400 mb-1">Avg Duration</p>
                     <p className="text-lg font-semibold text-amber-400">
                       {Math.round(
-                        analytics.performance.average_run_duration_seconds / 60,
+                        (analytics.performance.average_run_duration_seconds ?? 0) / 60,
                       )}{" "}
                       min
                     </p>
@@ -1394,7 +1394,7 @@ export default function ProjectDetailsPage() {
                         Est. Total Items
                       </p>
                       <p className="text-lg font-semibold text-slate-300">
-                        {analytics.performance.estimated_total_items.toLocaleString()}
+                        {(analytics.performance.estimated_total_items ?? 0).toLocaleString()}
                       </p>
                     </div>
                   )}
@@ -1425,7 +1425,7 @@ export default function ProjectDetailsPage() {
                         Total Products
                       </p>
                       <p className="text-xl font-semibold text-white">
-                        {metadata.total_products.toLocaleString()}
+                        {(metadata.total_products ?? 0).toLocaleString()}
                       </p>
                     </div>
                   )}
