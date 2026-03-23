@@ -100,7 +100,7 @@ class ParseHubDatabase:
             """Extract column names from Snowflake ResultMetadata objects"""
             if not hasattr(self.cursor, 'description') or not self.cursor.description:
                 return []
-            return [col.name for col in self.cursor.description]
+            return [col.name.lower() for col in self.cursor.description]
         
         def _row_to_dict(self, row):
             """Convert Snowflake tuple row to dict using column names"""
@@ -573,6 +573,76 @@ class ParseHubDatabase:
                 'ALTER TABLE runs ADD COLUMN completion_percentage REAL DEFAULT 0')
         except:
             pass  # Column already exists
+
+        # Scheduled runs - stores scheduled project execution records
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS scheduled_runs (
+                job_id TEXT PRIMARY KEY,
+                project_token TEXT NOT NULL,
+                schedule_type TEXT NOT NULL,
+                scheduled_time TEXT,
+                frequency TEXT,
+                day_of_week TEXT,
+                pages INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                active BOOLEAN DEFAULT 1,
+                FOREIGN KEY (project_token) REFERENCES projects(token)
+            )
+        ''')
+
+        # Create index for efficient scheduled runs queries
+        cursor.execute(
+            'CREATE INDEX IF NOT EXISTS idx_scheduled_runs_project_token ON scheduled_runs(project_token)')
+        cursor.execute(
+            'CREATE INDEX IF NOT EXISTS idx_scheduled_runs_active ON scheduled_runs(active)')
+
+        # Group runs - track batch group executions
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS group_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_run_id TEXT UNIQUE NOT NULL,
+                brand TEXT NOT NULL,
+                total_projects INTEGER NOT NULL,
+                completed_projects INTEGER DEFAULT 0,
+                failed_projects INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'running',
+                execution_mode TEXT DEFAULT 'sequential',
+                max_parallel INTEGER DEFAULT 1,
+                retry_on_failure BOOLEAN DEFAULT 0,
+                max_retries INTEGER DEFAULT 0,
+                delay_between_runs INTEGER DEFAULT 1000,
+                start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                end_time TIMESTAMP,
+                results_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # Group run projects - track individual project results in a group run
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS group_run_projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_run_id TEXT NOT NULL,
+                project_token TEXT NOT NULL,
+                project_name TEXT,
+                status TEXT DEFAULT 'pending',
+                run_token TEXT,
+                attempt_number INTEGER DEFAULT 1,
+                success BOOLEAN,
+                error_message TEXT,
+                start_time TIMESTAMP,
+                end_time TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (group_run_id) REFERENCES group_runs(group_run_id)
+            )
+        ''')
+
+        # Create indexes for group runs
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_group_runs_brand ON group_runs(brand)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_group_runs_status ON group_runs(status)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_group_run_projects_group_id ON group_run_projects(group_run_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_group_run_projects_token ON group_run_projects(project_token)')
 
         # Product data table - stores actual scraped product data
         cursor.execute('''
@@ -2458,26 +2528,29 @@ class ParseHubDatabase:
                 if not token:
                     continue
 
-                # Try to insert, update if exists
-                cursor.execute('''
-                    INSERT INTO projects (token, title, owner_email, main_site, updated_at)
-                    VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
-                    ON CONFLICT(token) DO UPDATE SET
-                        title = excluded.title,
-                        owner_email = excluded.owner_email,
-                        main_site = excluded.main_site,
-                        updated_at = CURRENT_TIMESTAMP
-                ''', (token, title, owner_email, main_site))
+                # Try to insert first
+                try:
+                    cursor.execute('''
+                        INSERT INTO projects (token, title, owner_email, main_site, updated_at)
+                        VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    ''', (token, title, owner_email, main_site))
+                    inserted += 1
+                except Exception as insert_err:
+                    # If insert fails (duplicate key), try update
+                    try:
+                        cursor.execute('''
+                            UPDATE projects 
+                            SET title = %s, owner_email = %s, main_site = %s, updated_at = CURRENT_TIMESTAMP
+                            WHERE token = %s
+                        ''', (title, owner_email, main_site, token))
+                        if cursor.rowcount > 0:
+                            updated += 1
+                    except Exception as update_err:
+                        pass  # Skip if both insert and update fail
 
                 cursor.execute(
                     'SELECT id FROM projects WHERE token = %s', (token,))
                 result = cursor.fetchone()
-
-                if cursor.rowcount > 0:
-                    if cursor.lastrowid:
-                        inserted += 1
-                    else:
-                        updated += 1
 
             # Auto-link projects to metadata by project_name matching
             self._link_projects_to_metadata(cursor)

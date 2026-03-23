@@ -21,6 +21,8 @@ import {
 import SchedulerModal from "./SchedulerModal";
 import ColumnStatisticsModal from "./ColumnStatisticsModal";
 import CSVDataModal from "./CSVDataModal";
+import BatchRunConfigModal from "./BatchRunConfigModal";
+import GroupRunProgress from "./GroupRunProgress";
 
 interface Project {
   token: string;
@@ -29,6 +31,11 @@ interface Project {
   owner_email?: string;
   projecturl?: string;
   main_site?: string;
+  metadata?: {
+    id: number;
+    total_pages?: number;
+    total_products?: number;
+  };
   last_run?: {
     status: string;
     pages: number;
@@ -65,6 +72,36 @@ export default function ProjectsList({
   const [selectedProjectName, setSelectedProjectName] = useState<string | null>(
     null,
   );
+  const [scheduledProjects, setScheduledProjects] = useState<Set<string>>(
+    new Set(),
+  );
+  const [showBatchConfig, setShowBatchConfig] = useState(false);
+  const [selectedBrand, setSelectedBrand] = useState<string | null>(null);
+  const [activeGroupRunId, setActiveGroupRunId] = useState<string | null>(null);
+  const [showGroupProgress, setShowGroupProgress] = useState(false);
+  const [batchResults, setBatchResults] = useState<any>(null);
+
+  // Fetch scheduled runs on component mount
+  useEffect(() => {
+    const fetchScheduledRuns = async () => {
+      try {
+        const response = await apiClient.get('/api/scheduled-runs');
+        if (response.status === 200 && response.data.scheduled_runs) {
+          const tokens = new Set(
+            response.data.scheduled_runs.map((run: any) => run.project_token)
+          );
+          setScheduledProjects(tokens);
+        }
+      } catch (error) {
+        console.error('Error fetching scheduled runs:', error);
+      }
+    };
+
+    fetchScheduledRuns();
+    // Refresh scheduled runs every 30 seconds
+    const interval = setInterval(fetchScheduledRuns, 30000);
+    return () => clearInterval(interval);
+  }, []);
 
   useEffect(() => {
     // Helper function to extract website domain from project name
@@ -124,17 +161,69 @@ export default function ProjectsList({
     }
   };
 
-  const handleRunAll = async (brand: string) => {
-    const brandProjects = groupedByBrand.get(brand);
+  const handleRunAll = async (brand: string) => {    const brandProjects = groupedByBrand.get(brand);
+    
+    if (!brandProjects || brandProjects.length === 0) {
+      alert("No projects found for this brand. Please add projects first.");
+      return;
+    }
+
+    if (brandProjects.some(p => !p.token)) {
+      alert("Some projects have invalid tokens. Please ensure all projects have valid tokens.");
+      return;
+    }
+    setSelectedBrand(brand);
+    setShowBatchConfig(true);
+  };
+
+  const handleBatchConfigSubmit = async (config: any) => {
+    if (!selectedBrand) return;
+
+    const brandProjects = groupedByBrand.get(selectedBrand);
     if (!brandProjects) return;
 
-    for (const project of brandProjects) {
-      try {
-        await handleRunProject(project.token);
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-      } catch (error) {
-        console.error(`Failed to run ${project.name}:`, error);
+    const projectTokens = brandProjects.map((p) => p.token).filter(Boolean);
+    
+    console.log(`[BatchRun] Batch run for brand: ${selectedBrand}`);
+    console.log(`[BatchRun] Running ${projectTokens.length} projects`);
+
+    if (projectTokens.length === 0) {
+      alert("❌ No valid project tokens found. Unable to run batch.");
+      return;
+    }
+
+    try {
+      const requestBody = {
+        project_tokens: projectTokens,
+      };
+
+      console.log(`[BatchRun] Sending batch request with tokens:`, projectTokens);
+
+      const response = await fetch("/api/projects/batch/run", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...getApiHeaders(),
+        },
+        body: JSON.stringify(requestBody),
+      });
+
+      const data = await response.json();
+      console.log(`[BatchRun] Response:`, data);
+
+      if (data.success) {
+        // Store results and show results modal
+        setBatchResults(data);
+        setShowGroupProgress(true);
+        setShowBatchConfig(false);
+      } else {
+        const errorMsg = data.error || "Failed to start batch run";
+        console.error("Batch run error:", errorMsg);
+        alert(`❌ Error: ${errorMsg}\n\nTips:\n- Verify project tokens are valid\n- Check ParseHub API key\n- Ensure projects exist in ParseHub`);
       }
+    } catch (error) {
+      console.error("Failed to start batch run:", error);
+      alert("❌ Failed to start batch run. Check console for details.");
     }
   };
 
@@ -373,6 +462,15 @@ export default function ProjectsList({
                                 {project.name}
                               </div>
                               <div className="flex items-center gap-2 flex-wrap">
+                                {scheduledProjects.has(project.token) && (
+                                  <span
+                                    className="inline-flex items-center gap-1 bg-purple-900/60 px-2 py-1 rounded text-xs text-purple-300 font-semibold border border-purple-500/50"
+                                    title="This project has scheduled runs"
+                                  >
+                                    <Clock className="w-3 h-3" />
+                                    Scheduled
+                                  </span>
+                                )}
                                 <code className="inline-flex items-center gap-1 bg-slate-800/80 px-2 py-0.5 rounded text-xs text-slate-400 font-mono border border-slate-700/50">
                                   <span className="text-slate-500">•</span>{" "}
                                   {project.token}
@@ -383,6 +481,11 @@ export default function ProjectsList({
                         </td>
                         <td className="px-6 py-4">
                           {getStatusBadge(project.last_run?.status)}
+                        </td>
+                        <td className="px-6 py-4 text-center">
+                          <span className="inline-flex items-center px-3 py-1.5 rounded-lg bg-slate-700/30 text-slate-300 font-semibold text-sm border border-slate-600/30">
+                            {project.metadata?.total_pages ? `${project.metadata.total_pages}` : '—'}
+                          </span>
                         </td>
                         <td className="px-6 py-4">
                           <div className="flex items-center justify-center gap-2">
@@ -556,6 +659,23 @@ export default function ProjectsList({
           }}
         />
       )}
+
+      {/* Batch Run Config Modal */}
+      <BatchRunConfigModal
+        isOpen={showBatchConfig}
+        onClose={() => setShowBatchConfig(false)}
+        onSubmit={handleBatchConfigSubmit}
+        projectCount={groupedByBrand.get(selectedBrand || "")?.length || 0}
+      />
+
+      {/* Group Run Progress Modal */}
+      <GroupRunProgress
+        groupRunId={activeGroupRunId || ""}
+        brand={selectedBrand || ""}
+        isOpen={showGroupProgress}
+        onClose={() => setShowGroupProgress(false)}
+        results={batchResults}
+      />
     </div>
   );
 }

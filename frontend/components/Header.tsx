@@ -1,13 +1,15 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Layers, Clock, Wifi, Home, FileUp, Settings } from "lucide-react";
+import { Layers, Clock, Wifi, Home, FileUp, Settings, CalendarClock } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import ScheduledRunsModal from "./ScheduledRunsModal";
 
 export default function Header() {
   const [time, setTime] = useState<string>("");
   const [date, setDate] = useState<string>("");
+  const [showScheduledRuns, setShowScheduledRuns] = useState(false);
   const pathname = usePathname();
 
   useEffect(() => {
@@ -86,7 +88,20 @@ export default function Header() {
             <FileUp className="w-4 h-4" />
             Import
           </Link>
+          <button
+            onClick={() => setShowScheduledRuns(true)}
+            className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg font-medium transition-all duration-200 text-slate-400 hover:text-slate-300 hover:bg-slate-800/50 ml-auto"
+            title="View scheduled project runs"
+          >
+            <CalendarClock className="w-4 h-4" />
+            Scheduled Runs
+          </button>
         </nav>
+
+        <ScheduledRunsModal
+          isOpen={showScheduledRuns}
+          onClose={() => setShowScheduledRuns(false)}
+        />
       </div>
     </header>
   );

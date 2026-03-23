@@ -9,6 +9,11 @@ interface DetailsModalProps {
     token: string
     title: string
     owner_email: string
+    metadata?: {
+      id: number
+      total_pages?: number
+      total_products?: number
+    }
     last_run?: {
       pages: number
       status: string
@@ -49,6 +54,22 @@ export default function DetailsModal({
             </div>
           </div>
         </div>
+
+        {project.metadata && (
+          <div className="bg-slate-700/20 rounded-lg p-4 border border-slate-700">
+            <h3 className="font-semibold text-white mb-3">Metadata</h3>
+            <div className="space-y-3 text-sm">
+              <div>
+                <p className="text-slate-400 mb-1">Total Pages (Target)</p>
+                <p className="text-slate-100 font-medium">{project.metadata.total_pages || 'Not set'}</p>
+              </div>
+              <div>
+                <p className="text-slate-400 mb-1">Total Products</p>
+                <p className="text-slate-100 font-medium">{project.metadata.total_products || 'Not set'}</p>
+              </div>
+            </div>
+          </div>
+        )}
 
         {project.last_run && (
           <div className="bg-slate-700/20 rounded-lg p-4 border border-slate-700">

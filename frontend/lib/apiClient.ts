@@ -40,15 +40,29 @@ apiClient.interceptors.response.use(
         }
 
         const errorData = error.response?.data ?? {};
-        const errorMsg =
+        const status = error.response?.status;
+        const statusText = error.response?.statusText;
+        
+        let errorMsg =
             (errorData as Record<string, string>).error ??
-            (errorData as Record<string, string>).details ??
-            `HTTP ${error.response?.status} ${error.response?.statusText}`;
+            (errorData as Record<string, string>).details;
+        
+        if (!errorMsg) {
+            if (status && statusText) {
+                errorMsg = `HTTP ${status} ${statusText}`;
+            } else if (status) {
+                errorMsg = `HTTP Error ${status}`;
+            } else if (error.message) {
+                errorMsg = error.message;
+            } else {
+                errorMsg = 'An unexpected error occurred';
+            }
+        }
 
         return Promise.reject({
             isNetworkError: false,
             message: errorMsg,
-            status: error.response?.status,
+            status: status,
             originalError: error,
             data: errorData,
         });

@@ -32,9 +32,11 @@ from src.services.monitoring_service import MonitoringService
 from src.services.analytics_service import AnalyticsService
 from src.services.excel_import_service import ExcelImportService
 from src.services.auto_runner_service import AutoRunnerService
+from src.services.group_run_service import GroupRunService
 from src.api.fetch_projects import fetch_all_projects, get_all_projects_with_cache
 from src.services.incremental_scraping_scheduler import start_incremental_scraping_scheduler, stop_incremental_scraping_scheduler
 from src.services.auto_sync_service import start_auto_sync_service, stop_auto_sync_service, get_auto_sync_service
+from src.services.scheduled_run_service import start_scheduled_run_service, stop_scheduled_run_service, get_scheduled_run_service
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -57,6 +59,7 @@ _monitoring_service = None
 _analytics_service = None
 _excel_import_service = None
 _auto_runner_service = None
+_group_run_service = None
 _services_initialized = False
 _services_lock = __import__('threading').Lock()
 
@@ -81,7 +84,7 @@ def _initialize_services():
     pool_pre_ping will recover connections automatically when PG is healthy.
     """
     global _db, _monitoring_service, _analytics_service
-    global _excel_import_service, _auto_runner_service, _services_initialized
+    global _excel_import_service, _auto_runner_service, _group_run_service, _services_initialized
 
     with _services_lock:
         if _services_initialized:
@@ -110,6 +113,7 @@ def _initialize_services():
             _analytics_service    = AnalyticsService()
             _excel_import_service = ExcelImportService(_db)
             _auto_runner_service  = AutoRunnerService()
+            _group_run_service    = GroupRunService(_db)
         except Exception as exc:
             logger.error(f'[boot] Service setup failed: {exc}')
 
@@ -141,6 +145,14 @@ def _initialize_services():
             logger.debug(f'[boot] Metadata columns log skipped: {exc}')
 
         logger.info('[boot] Initialization complete (DB errors above are non-fatal).')
+
+
+def get_group_run_service() -> 'GroupRunService':
+    """Get or initialize the group run service"""
+    global _group_run_service
+    if _group_run_service is None:
+        _group_run_service = GroupRunService(get_db())
+    return _group_run_service
 
 
 @app.before_request
@@ -236,6 +248,13 @@ def _start_background_services():
         if get_auto_sync_service() is None:
             start_incremental_scraping_scheduler(check_interval)
             start_auto_sync_service(sync_interval)
+            
+            # Start scheduled run service with database
+            scheduled_service = start_scheduled_run_service()
+            if _db is not None:
+                scheduled_service.set_database(_db)
+                logger.info('[bg] Scheduled run service linked to database')
+            
             logger.info('[bg] Background services started.')
     except Exception as exc:
         logger.error(f'[bg] Failed to start background services: {exc}')
@@ -629,11 +648,30 @@ def update_metadata(metadata_id):
     {
         "current_page_scraped": 5,
         "current_product_scraped": 100,
-        "last_known_url": "..."
+        "last_known_url": "...",
+        "total_pages": 100
     }
     """
     try:
         data = request.get_json()
+        total_pages = data.get('total_pages')
+        
+        # Update total_pages if provided
+        if total_pages is not None:
+            logger.info(f'[Metadata] Updating total_pages for metadata_id {metadata_id} to {total_pages}')
+            try:
+                conn = g.db.connect()
+                cursor = g.db.cursor()
+                cursor.execute(
+                    'UPDATE metadata SET total_pages = %s, updated_date = %s WHERE id = %s',
+                    (int(total_pages), datetime.now().isoformat(), metadata_id)
+                )
+                conn.commit()
+                g.db.disconnect()
+                logger.info(f'[Metadata] Successfully updated total_pages for metadata_id {metadata_id}')
+            except Exception as e:
+                logger.error(f'[Metadata] Failed to update total_pages: {e}')
+                return jsonify({'error': f'Failed to update total_pages: {str(e)}'}), 500
 
         success = g.db.update_metadata_progress(
             metadata_id,
@@ -642,7 +680,7 @@ def update_metadata(metadata_id):
             last_known_url=data.get('last_known_url')
         )
 
-        if not success:
+        if not success and total_pages is None:
             return jsonify({'error': 'Failed to update metadata'}), 500
 
         record = g.db.get_metadata_by_id(metadata_id)
@@ -954,9 +992,9 @@ def get_projects():
         logger.info(
             f'[API] Retrieved {len(all_projects)} total projects from cache')
 
-        # Sync projects if cache was refreshed (optional, can skip on pagination calls)
-        # This is now deferred to reduce response time
-        if page == 1:
+        # Skip sync on first page to respond faster - sync is deferred to background
+        # This prevents 30-second timeouts when syncing is slow
+        if page == 1 and False:  # Disabled: skip sync entirely to prevent timeout
             logger.info('[API] First page - syncing projects in background...')
             try:
                 sync_result = g.db.sync_projects(all_projects)
@@ -1585,6 +1623,187 @@ def run_project(token: str):
         return jsonify({'error': str(e), 'success': False}), 500
 
 
+@app.route('/api/projects/batch/run', methods=['POST'])
+def batch_run_projects():
+    """
+    Run multiple projects sequentially by calling their run tokens
+    
+    Request body:
+    {
+        "project_tokens": ["token1", "token2", ...]
+    }
+    
+    Returns immediate results with run_tokens for each project
+    """
+    try:
+        data = request.get_json() or {}
+        tokens = data.get('project_tokens', [])
+        
+        logger.info(f'[BATCH] Batch run request for {len(tokens)} projects')
+        
+        if not tokens or len(tokens) == 0:
+            return jsonify({'error': 'No projects selected. Please select at least one project to run.'}), 400
+        
+        # Get group run service and run projects sequentially
+        group_run_service = get_group_run_service()
+        result = group_run_service.run_group(tokens)
+        
+        return jsonify(result), 200 if result['success'] else 400
+        
+    except Exception as e:
+        logger.error(f'[BATCH] Error in batch run: {str(e)}', exc_info=True)
+        return jsonify({'error': f'Batch run failed: {str(e)}', 'success': False}), 500
+
+
+@app.route('/api/projects/schedule', methods=['POST'])
+def schedule_project_run():
+    """
+    Schedule a project run for a specific time
+    
+    Request body:
+    {
+        "projectToken": "...",
+        "scheduleType": "once" or "recurring",
+        "scheduledTime": "2026-03-15T14:30",
+        "frequency": "daily" or "weekly" or "monthly" (for recurring),
+        "dayOfWeek": "monday" or "tuesday" etc. (for weekly recurring),
+        "pages": 1 (optional, default 1)
+    }
+    
+    Returns:
+    {
+        "success": true,
+        "job_id": "...",
+        "message": "...",
+        "scheduled_time": "2026-03-15T14:30"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        project_token = data.get('projectToken')
+        schedule_type = data.get('scheduleType', 'once')
+        scheduled_time = data.get('scheduledTime')
+        
+        # Get pages and validate
+        try:
+            pages = int(data.get('pages', 1))
+        except (ValueError, TypeError):
+            return jsonify({'error': 'Pages must be an integer', 'success': False}), 400
+        
+        # Validate pages range
+        if pages < 1:
+            return jsonify({'error': 'Pages must be at least 1', 'success': False}), 400
+        
+        # Validate pages limit (reasonable maximum)
+        MAX_PAGES = 1000
+        if pages > MAX_PAGES:
+            return jsonify({'error': f'Pages cannot exceed {MAX_PAGES}', 'success': False}), 400
+        
+        if not project_token:
+            return jsonify({'error': 'Missing projectToken', 'success': False}), 400
+        
+        if not scheduled_time:
+            return jsonify({'error': 'Missing scheduledTime', 'success': False}), 400
+        
+        if schedule_type not in ['once', 'recurring']:
+            return jsonify({'error': 'scheduleType must be once or recurring', 'success': False}), 400
+        
+        scheduler = get_scheduled_run_service()
+        
+        logger.info(f'[API] Scheduling {schedule_type} run: {project_token} at {scheduled_time}')
+        
+        if schedule_type == 'once':
+            result = scheduler.schedule_once(project_token, scheduled_time, pages)
+        else:
+            frequency = data.get('frequency', 'daily')
+            day_of_week = data.get('dayOfWeek')
+            result = scheduler.schedule_recurring(project_token, scheduled_time, frequency, day_of_week, pages)
+        
+        if result.get('success'):
+            logger.info(f'[API] ✅ Schedule created: {result.get("job_id")}')
+            return jsonify(result), 200
+        else:
+            logger.error(f'[API] Schedule failed: {result.get("error")}')
+            return jsonify(result), 400
+    
+    except Exception as e:
+        logger.error(f'[API] Error scheduling run: {e}')
+        return jsonify({'error': str(e), 'success': False}), 500
+
+
+@app.route('/api/scheduled-runs', methods=['GET'])
+def get_scheduled_runs():
+    """Get all scheduled project runs"""
+    try:
+        scheduler = get_scheduled_run_service()
+        runs = scheduler.get_scheduled_runs()
+        
+        logger.info(f'[API] Retrieved {len(runs)} scheduled runs')
+        return jsonify({
+            'success': True,
+            'scheduled_runs': runs,
+            'count': len(runs)
+        }), 200
+    except Exception as e:
+        logger.error(f'[API] Error getting scheduled runs: {e}')
+        return jsonify({'error': str(e), 'success': False}), 500
+
+
+@app.route('/api/scheduled-runs/<job_id>', methods=['DELETE'])
+def cancel_scheduled_run(job_id: str):
+    """Cancel a scheduled run by job ID"""
+    try:
+        scheduler = get_scheduled_run_service()
+        result = scheduler.cancel_scheduled_run(job_id)
+        
+        if result.get('success'):
+            logger.info(f'[API] ✅ Cancelled scheduled run: {job_id}')
+            return jsonify(result), 200
+        else:
+            logger.error(f'[API] Cancel failed: {result.get("error")}')
+            return jsonify(result), 400
+    except Exception as e:
+        logger.error(f'[API] Error cancelling scheduled run: {e}')
+        return jsonify({'error': str(e), 'success': False}), 500
+
+
+@app.route('/api/scheduler/debug', methods=['GET'])
+def debug_scheduler():
+    """Debug endpoint to check scheduler status and diagnostics"""
+    try:
+        from tzlocal import get_localzone
+        from datetime import datetime
+        
+        scheduler = get_scheduled_run_service()
+        local_tz = get_localzone()
+        
+        diagnostics = {
+            'success': True,
+            'scheduler_running': scheduler.scheduler.running,
+            'system_timezone': str(local_tz),
+            'current_time': datetime.now(local_tz).isoformat(),
+            'current_time_utc': datetime.utcnow().isoformat(),
+            'scheduled_runs': scheduler.get_scheduled_runs(),
+            'scheduled_runs_count': len(scheduler.scheduled_runs),
+            'scheduler_jobs': []
+        }
+        
+        # List all jobs in scheduler
+        for job in scheduler.scheduler.get_jobs():
+            diagnostics['scheduler_jobs'].append({
+                'id': job.id,
+                'func': str(job.func),
+                'trigger': str(job.trigger),
+                'next_run_time': job.next_run_time.isoformat() if job.next_run_time else None
+            })
+        
+        logger.info(f'[DEBUG] Scheduler diagnostics: {scheduler.scheduler.running}, TZ={local_tz}')
+        return jsonify(diagnostics), 200
+    except Exception as e:
+        logger.error(f'[DEBUG] Error getting scheduler diagnostics: {e}')
+        return jsonify({'error': str(e), 'success': False}), 500
+
+
 @app.route('/api/projects/<token>/analytics', methods=['GET'])
 def get_project_analytics(token: str):
     """
@@ -2114,5 +2333,6 @@ if __name__ == '__main__':
         logger.info('Shutting down services...')
         stop_incremental_scraping_scheduler()
         stop_auto_sync_service()
+        stop_scheduled_run_service()
         logger.info('Services stopped')
 

@@ -58,6 +58,11 @@ interface Project {
   owner_email: string;
   projecturl?: string;
   main_site?: string;
+  metadata?: {
+    id: number;
+    total_pages?: number;
+    total_products?: number;
+  };
   last_run: {
     status: string;
     pages: number;
@@ -243,7 +248,24 @@ export default function Home() {
         );
       }
 
-      setProjects(allProjects);
+      // Enrich projects with metadata
+      const projectsWithMetadata = await Promise.all(
+        allProjects.map(async (project: Project) => {
+          try {
+            const metaRes = await fetch(`/api/metadata?project_token=${project.token}`);
+            const metaData = await metaRes.json();
+            
+            if (metaData.success && metaData.records?.length > 0) {
+              project.metadata = metaData.records[0];
+            }
+          } catch (err) {
+            console.error(`Failed to fetch metadata for ${project.token}:`, err);
+          }
+          return project;
+        })
+      );
+
+      setProjects(projectsWithMetadata);
       setLastUpdate(new Date());
       setBackendDown(false);
 

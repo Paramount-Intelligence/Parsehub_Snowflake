@@ -32,6 +32,33 @@ export default function RunDialog({
   const [isRunning, setIsRunning] = useState(false);
   const [sessionId, setSessionId] = useState<number | null>(null);
   const [showProgress, setShowProgress] = useState(false);
+  const [metadataId, setMetadataId] = useState<number | null>(null);
+
+  // Load metadata when dialog opens
+  React.useEffect(() => {
+    if (isOpen && projectToken) {
+      const loadMetadata = async () => {
+        try {
+          const response = await fetch(`/api/metadata?project_token=${projectToken}`);
+          const data = await response.json();
+          
+          if (data.success && data.records && data.records.length > 0) {
+            const metadata = data.records[0];
+            setMetadataId(metadata.id);
+            
+            // Pre-fill pages with total_pages from metadata
+            if (metadata.total_pages) {
+              setPages(metadata.total_pages.toString());
+            }
+          }
+        } catch (err) {
+          console.error("Failed to load metadata:", err);
+        }
+      };
+      
+      loadMetadata();
+    }
+  }, [isOpen, projectToken]);
 
   const handleRun = async () => {
     const pagesNum = parseInt(pages);
@@ -116,6 +143,20 @@ export default function RunDialog({
         const data = response.data;
 
         if (data.success && data.run_token) {
+          // Update metadata with the pages value
+          if (metadataId) {
+            try {
+              await fetch(`/api/metadata/${metadataId}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ total_pages: pagesNum })
+              });
+            } catch (err) {
+              console.error("Failed to update metadata:", err);
+              // Don't fail the run just because metadata update failed
+            }
+          }
+          
           onRunStart(data.run_token, pagesNum);
           setPages("");
           onClose();

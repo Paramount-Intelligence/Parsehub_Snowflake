@@ -12,6 +12,12 @@ export async function GET(request: NextRequest) {
   if (!params.has('page')) params.set('page', '1');
   if (!params.has('limit')) params.set('limit', '50');
 
+  // Add ParseHub API key (server-side only, never exposed to browser)
+  const apiKey = process.env.PARSEHUB_API_KEY;
+  if (apiKey && !params.has('api_key')) {
+    params.set('api_key', apiKey);
+  }
+
   return proxyToBackend(request, '/api/projects', params);
 }
 
