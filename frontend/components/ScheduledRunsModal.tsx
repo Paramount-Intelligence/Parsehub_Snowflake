@@ -123,11 +123,6 @@ export default function ScheduledRunsModal({ isOpen, onClose }: ScheduledRunsMod
                         <span className="px-2 py-0.5 bg-purple-600/50 text-purple-200 text-xs rounded-full flex-shrink-0">
                           {run.type === 'once' ? 'Once' : 'Recurring'}
                         </span>
-                        {run.pages > 1 && (
-                          <span className="px-2 py-0.5 bg-blue-600/50 text-blue-200 text-xs rounded-full flex-shrink-0">
-                            {run.pages} pages
-                          </span>
-                        )}
                       </div>
 
                       <p className="text-slate-300 text-sm mb-2">

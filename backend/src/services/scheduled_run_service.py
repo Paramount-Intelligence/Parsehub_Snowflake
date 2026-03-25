@@ -293,13 +293,43 @@ class ScheduledRunService:
             return {'success': False, 'error': str(e)}
 
     def get_scheduled_runs(self) -> list:
-        """Get all scheduled runs"""
-        # Return runs with job_id included
+        """Get all scheduled runs from database and memory"""
         result = []
+        
+        # First, load active runs from database to ensure up-to-date data
+        if self.db:
+            try:
+                conn = self.db.connect()
+                cursor = self.db.cursor()
+                query = "SELECT job_id, project_token, schedule_type, scheduled_time, frequency, day_of_week, pages, created_at FROM SCHEDULED_RUNS WHERE active = TRUE ORDER BY created_at DESC"
+                cursor.execute(query)
+                db_runs = cursor.fetchall()
+                self.db.disconnect()
+                
+                # Sync database runs with in-memory dict
+                for row in db_runs:
+                    job_id = row[0]
+                    if job_id not in self.scheduled_runs:
+                        # Add to in-memory dict if not already there
+                        self.scheduled_runs[job_id] = {
+                            'project_token': row[1],
+                            'type': row[2],
+                            'scheduled_time': row[3] if row[2] == 'once' else None,
+                            'frequency': row[4] if row[2] == 'recurring' else None,
+                            'time': row[3] if row[2] == 'recurring' else None,
+                            'day_of_week': row[5],
+                            'pages': int(row[6]),
+                            'created_at': row[7]
+                        }
+            except Exception as e:
+                logger.warning(f"[WARN] Could not load from database in get_scheduled_runs: {e}")
+        
+        # Return runs from in-memory dict with job_id included
         for job_id, run_data in self.scheduled_runs.items():
             run_with_id = dict(run_data)
             run_with_id['job_id'] = job_id
             result.append(run_with_id)
+        
         return result
 
     def _save_to_database(self, job_id: str, run_data: dict):
