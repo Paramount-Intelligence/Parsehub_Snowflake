@@ -627,6 +627,21 @@ export default function ProjectsList({
           }}
           onSchedule={(time) => {
             console.log(`Scheduled for ${time}`);
+            // Force refresh of scheduled runs to load the newly created one
+            const fetchScheduledRuns = async () => {
+              try {
+                const response = await apiClient.get('/api/scheduled-runs');
+                if (response.status === 200 && response.data.scheduled_runs) {
+                  const tokens = new Set(
+                    response.data.scheduled_runs.map((run: any) => run.project_token)
+                  );
+                  setScheduledProjects(tokens);
+                }
+              } catch (error) {
+                console.error('Error fetching scheduled runs:', error);
+              }
+            };
+            fetchScheduledRuns();
             setShowScheduler(false);
           }}
         />

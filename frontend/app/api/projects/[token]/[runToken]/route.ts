@@ -6,10 +6,10 @@ const BASE_URL = process.env.PARSEHUB_BASE_URL || 'https://www.parsehub.com/api/
 
 export async function GET(
   _request: NextRequest,
-  { params }: { params: { token: string; runToken: string } }
+  { params }: { params: Promise<{ token: string; runToken: string }> }
 ) {
   try {
-    const { token, runToken } = params
+    const { token, runToken } = await params
 
     const response = await axios.get(
       `${BASE_URL}/projects/${token}/runs/${runToken}/data`,

@@ -11,6 +11,7 @@ import logging
 from datetime import datetime, timedelta
 from threading import Thread, Event
 from typing import Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 import sys
 from pathlib import Path
@@ -38,11 +39,12 @@ class AutoSyncService:
     - Latest run details for each project
     """
 
-    def __init__(self):
+    def __init__(self, max_workers: int = 5):
         self.db = ParseHubDatabase()
         self.api_key = API_KEY
         self.base_url = BASE_URL
         self.sync_interval = SYNC_INTERVAL
+        self.max_workers = max_workers  # Number of parallel threads
         self.running = False
         self.thread = None
         self.stop_event = Event()
@@ -118,7 +120,8 @@ class AutoSyncService:
         results = {
             'projects_synced': 0,
             'runs_updated': 0,
-            'projects_updated': 0
+            'projects_updated': 0,
+            'failed_projects': []
         }
 
         try:
@@ -133,13 +136,56 @@ class AutoSyncService:
             logger.info(f"   Found {len(projects)} projects")
             results['projects_synced'] = len(projects)
 
-            # 2. Sync each project
-            for project in projects:
-                self.sync_project(project, results)
+            # 2. Sync each project IN PARALLEL using ThreadPoolExecutor
+            logger.info(f"\n2. Syncing {len(projects)} projects using "
+                       f"{self.max_workers} parallel workers...")
+            
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                # Submit all sync tasks - use inline function to avoid missing method issues
+                def sync_one_project(proj):
+                    try:
+                        # Keys required by sync_project / sync_run (parallel threads use local dict)
+                        tr = {'projects_updated': 0, 'runs_updated': 0}
+                        self.sync_project(proj, tr)
+                        return True
+                    except Exception as e:
+                        logger.error(f"Error syncing {proj.get('token', 'unknown')}: {e}")
+                        return False
+                
+                future_to_project = {
+                    executor.submit(sync_one_project, project): project
+                    for project in projects
+                }
+                
+                # Collect results as they complete
+                for future in as_completed(future_to_project):
+                    project = future_to_project[future]
+                    project_token = project.get('token', 'unknown')[:8]
+                    project_title = project.get('title', 'Unknown')[:30]
+                    
+                    try:
+                        success = future.result()
+                        if success:
+                            results['projects_updated'] += 1
+                            logger.info(f"   [OK] {project_title} ({project_token}...)")
+                        else:
+                            results['failed_projects'].append(project.get('token'))
+                            logger.warning(f"   [FAIL] {project_title} ({project_token}...)")
+                    except Exception as e:
+                        logger.error(f"   [ERROR] {project_title} ({project_token}...): {e}")
+                        results['failed_projects'].append(project.get('token'))
+
+            logger.info(f"\n   [SUMMARY] {results['projects_updated']}/{len(projects)} "
+                       f"projects synced successfully")
+            if results['failed_projects']:
+                logger.warning(f"   [WARN] {len(results['failed_projects'])} projects failed")
 
             # 3. Update active runs
             logger.info("\n3. Updating active runs...")
             self.update_active_runs(results)
+
+            # 4. Fetch and store scraped data for completed runs
+            self.sync_completed_runs_data(results)
 
             return results
 
@@ -195,7 +241,7 @@ class AutoSyncService:
             token = project.get('token')
             title = project.get('title', 'Unknown Project')
 
-            logger.info(f"\n2. Syncing: {title} ({token[:8]}...)")
+            logger.info(f"   Syncing project: {title} ({token[:8]}...)")
 
             # Update project in database
             conn = self.db.connect()
@@ -228,24 +274,21 @@ class AutoSyncService:
                     project_id = existing[0]
                 logger.info(f"   [OK] Updated project (ID: {project_id})")
             else:
-                # Insert new project
+                # Insert new project - generate ID using hash of token
+                # Snowflake doesn't auto-increment like SQLite, so we generate a unique ID
+                import hashlib
+                project_id = int(hashlib.md5(token.encode()).hexdigest(), 16) % (10**10)
+
                 cursor.execute('''
-                    INSERT INTO projects (token, title, owner_email, main_site)
-                    VALUES (%s, %s, %s, %s)
+                    INSERT INTO projects (id, token, title, owner_email, main_site)
+                    VALUES (%s, %s, %s, %s, %s)
                 ''', (
+                    project_id,
                     token,
                     title,
                     project.get('owner_email'),
                     project.get('main_site')
                 ))
-                # Snowflake doesn't support lastrowid, so query the ID we just inserted
-                cursor.execute('SELECT id FROM projects WHERE token = %s', (token,))
-                inserted = cursor.fetchone()
-                if isinstance(inserted, dict):
-                    inserted_lower = {k.lower(): v for k, v in inserted.items()}
-                    project_id = inserted_lower.get('id')
-                else:
-                    project_id = inserted[0] if inserted else None
                 logger.info(f"   [OK] Created new project (ID: {project_id})")
 
             conn.commit()
@@ -337,14 +380,20 @@ class AutoSyncService:
                             f"   [OK] Updated run {run_token[:8]}... ({old_status} -> {status})")
                         results['runs_updated'] += 1
             else:
-                # Insert new run
+                # Insert new run - generate ID using Snowflake sequence or hash
+                # Snowflake doesn't auto-increment like SQLite, so we generate a unique ID
+                import hashlib
+                # Generate a numeric ID from run_token (which is unique)
+                run_id = int(hashlib.md5(run_token.encode()).hexdigest(), 16) % (10**10)
+
                 cursor.execute('''
                     INSERT INTO runs (
-                        project_id, run_token, status, pages_scraped,
+                        id, project_id, run_token, status, pages_scraped,
                         start_time, end_time, duration_seconds
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ''', (
+                    run_id,
                     project_id,
                     run_token,
                     status,
@@ -354,16 +403,8 @@ class AutoSyncService:
                     duration
                 ))
 
-                # Snowflake doesn't support lastrowid, so query the ID we just inserted
-                cursor.execute('SELECT id FROM runs WHERE run_token = %s', (run_token,))
-                inserted_run = cursor.fetchone()
-                if isinstance(inserted_run, dict):
-                    inserted_run_lower = {k.lower(): v for k, v in inserted_run.items()}
-                    run_id = inserted_run_lower.get('id')
-                else:
-                    run_id = inserted_run[0] if inserted_run else None
                 logger.info(
-                    f"   [OK] Created new run {run_token[:8]}... (status: {status})")
+                    f"   [OK] Created new run {run_token[:8]}... (ID: {run_id}, status: {status})")
                 results['runs_updated'] += 1
 
             conn.close()
@@ -460,6 +501,214 @@ class AutoSyncService:
         """Manually trigger a sync (useful for API endpoints)"""
         logger.info("Manual sync triggered")
         return self.sync_all()
+
+    def fetch_and_store_run_data(self, project_token: str, run_token: str, project_title: str = "") -> bool:
+        """
+        Fetch scraped data from ParseHub run and store it to Snowflake
+        Returns True if successful, False otherwise
+        """
+        try:
+            logger.info(f"   [DATA] Fetching data for run {run_token[:8]}...")
+            
+            # Fetch data in CSV format
+            response = requests.get(
+                f"{self.base_url}/runs/{run_token}/data",
+                params={'api_key': self.api_key, 'format': 'csv'},
+                timeout=60
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"   [DATA] Failed to fetch data: HTTP {response.status_code}")
+                return False
+            
+            csv_data = response.text
+            if not csv_data or len(csv_data.strip()) == 0:
+                logger.warning(f"   [DATA] Empty data from ParseHub")
+                return False
+            
+            # Parse CSV to records
+            records = self._parse_csv_to_records(csv_data)
+            if not records:
+                logger.warning(f"   [DATA] No records parsed from CSV")
+                return False
+            
+            logger.info(f"   [DATA] Parsed {len(records)} records from CSV")
+            
+            # Build analytics data structure
+            analytics_data = {
+                'overview': {
+                    'total_records_scraped': len(records),
+                    'total_runs': 1,
+                    'completed_runs': 1,
+                    'progress_percentage': 100,
+                },
+                'performance': {
+                    'items_per_minute': 0,
+                    'estimated_total_items': len(records),
+                    'average_run_duration_seconds': 0,
+                    'current_items_count': len(records),
+                },
+                'recovery': {
+                    'in_recovery': False,
+                    'status': 'complete',
+                    'total_recovery_attempts': 0,
+                },
+                'data_quality': {
+                    'average_completion_percentage': 100,
+                    'total_fields': len(records[0].keys()) if records else 0,
+                },
+                'timeline': [],
+            }
+            
+            # Store to database using the store_analytics_data method
+            result = self.db.store_analytics_data(
+                project_token=project_token,
+                run_token=run_token,
+                analytics_data=analytics_data,
+                records=records,
+                csv_data=csv_data
+            )
+            
+            if result:
+                logger.info(f"   [DATA] Successfully stored {len(records)} records to Snowflake")
+                return True
+            else:
+                logger.error(f"   [DATA] Failed to store data to Snowflake")
+                return False
+                
+        except Exception as e:
+            logger.error(f"   [DATA] Error fetching/storing run data: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def _parse_csv_to_records(self, csv_text: str) -> List[Dict]:
+        """Parse CSV text to list of record dictionaries"""
+        records = []
+        try:
+            lines = csv_text.strip().split('\n')
+            if not lines:
+                return records
+            
+            # Parse header
+            headers = lines[0].split(',')
+            headers = [h.strip().replace('"', '') for h in headers]
+            
+            # Parse rows
+            for i in range(1, len(lines)):
+                if not lines[i].strip():
+                    continue
+                
+                # Simple CSV parsing (handles basic cases)
+                values = []
+                current = ''
+                in_quotes = False
+                
+                for char in lines[i]:
+                    if char == '"':
+                        in_quotes = not in_quotes
+                    elif char == ',' and not in_quotes:
+                        values.append(current.strip().replace('"', ''))
+                        current = ''
+                    else:
+                        current += char
+                
+                values.append(current.strip().replace('"', ''))
+                
+                # Create record
+                record = {}
+                for idx, header in enumerate(headers):
+                    record[header] = values[idx] if idx < len(values) else ''
+                
+                records.append(record)
+            
+            return records
+        except Exception as e:
+            logger.error(f"Error parsing CSV: {e}")
+            return records
+
+    def sync_completed_runs_data(self, results: Dict):
+        """
+        Fetch and store actual scraped data for completed runs
+        This is called during sync to ensure data is stored in Snowflake
+        """
+        try:
+            logger.info("\n4. Fetching and storing scraped data for completed runs...")
+            
+            conn = self.db.connect()
+            cursor = self.db.cursor()
+            
+            # Find completed runs that don't have data stored yet
+            # Check by looking at runs with status 'complete' in the last 24 hours
+            since = datetime.now() - timedelta(hours=24)
+            
+            cursor.execute('''
+                SELECT r.id, r.run_token, r.project_token, p.title
+                FROM runs r
+                JOIN projects p ON r.project_token = p.token
+                WHERE r.status = 'complete'
+                AND r.end_time >= %s
+                ORDER BY r.end_time DESC
+                LIMIT 10
+            ''', (since.isoformat(),))
+            
+            runs = cursor.fetchall()
+            
+            if not runs:
+                logger.info("   No recent completed runs to process")
+                return
+            
+            logger.info(f"   Found {len(runs)} completed runs to check")
+            
+            # Track results
+            stored_count = 0
+            
+            for run in runs:
+                # Handle both dict and tuple formats
+                if isinstance(run, dict):
+                    run_id = run.get('id')
+                    run_token = run.get('run_token')
+                    project_token = run.get('project_token')
+                    project_title = run.get('title', '')
+                else:
+                    run_id = run[0]
+                    run_token = run[1]
+                    project_token = run[2]
+                    project_title = run[3] if len(run) > 3 else ''
+                
+                # Check if data already exists for this run
+                cursor.execute('''
+                    SELECT COUNT(*) as count FROM analytics_cache
+                    WHERE run_token = %s
+                ''', (run_token,))
+                
+                existing = cursor.fetchone()
+                existing_count = 0
+                if isinstance(existing, dict):
+                    existing_count = existing.get('count', 0)
+                elif existing:
+                    existing_count = existing[0]
+                
+                if existing_count > 0:
+                    logger.info(f"   [SKIP] Data already stored for run {run_token[:8]}...")
+                    continue
+                
+                # Fetch and store data
+                logger.info(f"\n   [FETCH] {project_title} - Run {run_token[:8]}...")
+                success = self.fetch_and_store_run_data(project_token, run_token, project_title)
+                
+                if success:
+                    stored_count += 1
+                
+                time.sleep(0.5)  # Rate limiting
+            
+            logger.info(f"\n   [SUMMARY] Stored data for {stored_count} runs")
+            results['runs_data_stored'] = stored_count
+            
+        except Exception as e:
+            logger.error(f"Error syncing completed runs data: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 # Global instance

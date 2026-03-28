@@ -11,8 +11,15 @@ const nextConfig = {
   /**
    * Rewrite /api/:path* → backend /api/:path*
    *
-   * Use NEXT_PUBLIC_BACKEND_URL on Railway (e.g. https://parsehub-backend-production.up.railway.app).
-   * Do not set it without https://. Fallbacks: BACKEND_URL, BACKEND_API_URL.
+   * IMPORTANT: Do NOT rewrite batch endpoints. They have local route handlers in:
+   * - app/api/projects/batch/*
+   * - app/api/projects/[token]/batch/*
+   * - app/api/projects/[token]/checkpoint
+   *
+   * Route handlers are matched before rewrites, so these paths bypass rewrites.
+   * The route handlers use proxyToBackend() to forward to Flask as needed.
+   *
+   * Only rewrite paths without local route handlers.
    */
   async rewrites() {
     const backend =
@@ -32,15 +39,15 @@ const nextConfig = {
     const base = backend.replace(/\/$/, '');
 
     return [
-      { source: '/api/:path*', destination: `${base}/api/:path*` },
+      {
+        source: '/api/:path*',
+        destination: `${base}/api/:path*`,
+      },
     ];
   },
 
   typescript: {
     ignoreBuildErrors: true,
-  },
-  eslint: {
-    ignoreDuringBuilds: true,
   },
 };
 

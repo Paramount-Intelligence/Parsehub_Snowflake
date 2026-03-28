@@ -1,10 +1,11 @@
 "use client";
-import apiClient from "@/lib/apiClient";
 
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import Modal from "./Modal";
-import ProgressModal from "./ProgressModal";
-import { Play, AlertCircle, Zap } from "lucide-react";
+import MetadataProgressModal from "./MetadataProgressModal";
+import AutoCompleteStatus from "./AutoCompleteStatus";
+import { Play, AlertCircle, CheckCircle2, Loader } from "lucide-react";
+import { startOrResumeScraping, getCheckpoint, getProjectMetadata } from "@/lib/scrapingApi";
 
 interface RunDialogProps {
   isOpen: boolean;
@@ -25,362 +26,381 @@ export default function RunDialog({
   onRunStart,
   isLoading = false,
 }: RunDialogProps) {
-  const [pages, setPages] = useState<string>("");
-  const [useIncremental, setUseIncremental] = useState(false);
-  const [totalPages, setTotalPages] = useState<string>("");
   const [error, setError] = useState<string>("");
   const [isRunning, setIsRunning] = useState(false);
-  const [sessionId, setSessionId] = useState<number | null>(null);
-  const [showProgress, setShowProgress] = useState(false);
-  const [metadataId, setMetadataId] = useState<number | null>(null);
+  const [checkpoint, setCheckpoint] = useState<any>(null);
+  const [metadata, setMetadata] = useState<any>(null);
+  const [batchRunToken, setBatchRunToken] = useState<string | null>(null);
+  const [showBatchProgress, setShowBatchProgress] = useState(false);
+  const [loadingData, setLoadingData] = useState(true);
 
-  // Load metadata when dialog opens
-  React.useEffect(() => {
+  // Load checkpoint and metadata when dialog opens
+  useEffect(() => {
     if (isOpen && projectToken) {
-      const loadMetadata = async () => {
-        try {
-          const response = await fetch(`/api/metadata?project_token=${projectToken}`);
-          const data = await response.json();
-          
-          if (data.success && data.records && data.records.length > 0) {
-            const metadata = data.records[0];
-            setMetadataId(metadata.id);
-            
-            // Pre-fill pages with total_pages from metadata
-            if (metadata.total_pages) {
-              setPages(metadata.total_pages.toString());
-            }
-          }
-        } catch (err) {
-          console.error("Failed to load metadata:", err);
-        }
-      };
-      
-      loadMetadata();
+      loadData();
     }
   }, [isOpen, projectToken]);
 
-  const handleRun = async () => {
-    const pagesNum = parseInt(pages);
-    const totalPagesNum = parseInt(totalPages);
+  const loadData = async () => {
+    setLoadingData(true);
+    setError("");
+    
+    try {
+      // Load checkpoint
+      try {
+        const ckpt = await getCheckpoint(projectToken);
+        setCheckpoint(ckpt);
+      } catch (err) {
+        console.error("Failed to load checkpoint:", err);
+        // Checkpoint failure is not critical - continue
+      }
 
-    if (!pages || isNaN(pagesNum) || pagesNum < 1) {
-      setError("Please enter a valid number of pages");
-      return;
+      // Load metadata
+      try {
+        const meta = await getProjectMetadata(projectToken);
+        setMetadata(meta);
+      } catch (err) {
+        console.error("Failed to load metadata:", err);
+        // Extract error message properly
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (errMsg.includes('404')) {
+          setError('Project metadata not found. Make sure the project has been properly imported.');
+        } else if (errMsg.includes('timeout')) {
+          setError('Request timed out. Backend may be slow. Try again in a moment.');
+        } else {
+          setError('Failed to load project information. Please try again.');
+        }
+      }
+    } finally {
+      setLoadingData(false);
     }
+  };
 
-    if (
-      useIncremental &&
-      (!totalPages || isNaN(totalPagesNum) || totalPagesNum < pagesNum)
-    ) {
-      setError(
-        "Total pages must be greater than or equal to pages per iteration",
-      );
-      return;
-    }
-
+  const handleStart = async () => {
     setError("");
     setIsRunning(true);
 
     try {
-      if (useIncremental) {
-        // Fetch project details from ParseHub to get the URL if not provided
-        let urlToUse = projectURL;
-        if (!urlToUse) {
-          try {
-            const projectDetailsRes = await apiClient.get(
-              `/api/projects/${projectToken}`,
-            );
-            if (projectDetailsRes.status === 200) {
-              const projectData = projectDetailsRes.data;
-              urlToUse =
-                projectData.project?.url ||
-                projectData.project?.main_site ||
-                "";
-            }
-          } catch (err) {
-            console.error("Failed to fetch project URL:", err);
-            // Continue with empty URL, let backend handle the error
-          }
-        }
+      const result = await startOrResumeScraping(projectToken);
 
-        // Start incremental scraping
-        const response = await apiClient.post("/api/projects/incremental", {
-          project_token: projectToken,
-          project_name: projectTitle,
-          original_url: urlToUse,
-          total_pages: totalPagesNum,
-          pages_per_iteration: pagesNum,
-        });
-
-        if (!response.status || response.status >= 400) {
-          throw new Error("Failed to start incremental scraping");
-        }
-
-        const data = response.data;
-
-        if (data.success) {
-          setPages("");
-          setTotalPages("");
-          setUseIncremental(false);
-          setSessionId(data.session_id);
-          setShowProgress(true);
-          onClose();
-        } else {
-          setError(data.error || "Failed to start incremental scraping");
-        }
+      if (result.success && result.run_token) {
+        setBatchRunToken(result.run_token);
+        setShowBatchProgress(true);
+        onRunStart(result.run_token, result.total_pages || metadata?.total_pages || 0);
       } else {
-        // Regular run
-        const response = await apiClient.post("/api/projects/run", {
-          token: projectToken,
-          pages: pagesNum,
-        });
-
-        if (!response.status || response.status >= 400) {
-          throw new Error("Failed to start run");
-        }
-
-        const data = response.data;
-
-        if (data.success && data.run_token) {
-          // Update metadata with the pages value
-          if (metadataId) {
-            try {
-              await fetch(`/api/metadata/${metadataId}`, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ total_pages: pagesNum })
-              });
-            } catch (err) {
-              console.error("Failed to update metadata:", err);
-              // Don't fail the run just because metadata update failed
-            }
-          }
-          
-          onRunStart(data.run_token, pagesNum);
-          setPages("");
-          onClose();
+        const errMsg = result.error || result.message || result.reason || "Failed to start scraping";
+        if (errMsg.includes('already complete')) {
+          setError('This project is already complete - all pages have been scraped!');
+        } else if (errMsg.includes('not found')) {
+          setError('Project not found. Please refresh and try again.');
         } else {
-          setError(data.error || "Failed to start run");
+          setError(errMsg);
         }
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "An error occurred");
+      // Extract error message properly
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (errMsg.includes('timeout')) {
+        setError('Request timed out. Backend is not responding. Start the backend and try again.');
+      } else if (errMsg.includes('unreachable')) {
+        setError('Backend API is unreachable. Make sure the backend server is running on port 5000.');
+      } else {
+        setError(errMsg || "Failed to start scraping");
+      }
     } finally {
       setIsRunning(false);
     }
   };
 
-  const handlePagesChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setPages(e.target.value);
+  const handleResume = async () => {
     setError("");
+    setIsRunning(true);
+
+    try {
+      const result = await startOrResumeScraping(projectToken);
+
+      if (result.success && result.run_token) {
+        setBatchRunToken(result.run_token);
+        setShowBatchProgress(true);
+        onRunStart(result.run_token, result.total_pages || metadata?.total_pages || 0);
+      } else {
+        const errMsg = result.error || result.message || result.reason || "Failed to resume scraping";
+        if (errMsg.includes('already complete')) {
+          setError('This project is already complete - all pages have been scraped!');
+        } else if (errMsg.includes('not found')) {
+          setError('Project not found. Please refresh and try again.');
+        } else {
+          setError(errMsg);
+        }
+      }
+    } catch (err) {
+      // Extract error message properly
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (errMsg.includes('timeout')) {
+        setError('Request timed out. Backend is not responding. Start the backend and try again.');
+      } else if (errMsg.includes('unreachable')) {
+        setError('Backend API is unreachable. Make sure the backend server is running on port 5000.');
+      } else {
+        setError(errMsg || "Failed to resume scraping");
+      }
+    } finally {
+      setIsRunning(false);
+    }
   };
 
-  const handleTotalPagesChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setTotalPages(e.target.value);
-    setError("");
-  };
+  const canResume = checkpoint && checkpoint.highest_successful_page > 0 && !checkpoint?.is_project_complete;
+  const isComplete = checkpoint?.is_project_complete;
 
   return (
     <>
-      <Modal isOpen={isOpen} onClose={onClose} title={`Run: ${projectTitle}`}>
+      <Modal isOpen={isOpen} onClose={onClose} title={`Start Scraping: ${projectTitle}`}>
         <div className="space-y-6">
-          {/* Incremental Scraping Toggle */}
-          <div className="border-b border-slate-700/50 pb-5">
+          {/* Header Info */}
+          <div className="bg-gradient-to-r from-blue-900/30 to-cyan-900/30 border border-blue-700/50 rounded-xl p-5 space-y-3">
             <div className="flex items-start gap-3">
-              <input
-                type="checkbox"
-                id="incremental-toggle"
-                checked={useIncremental}
-                onChange={(e) => {
-                  setUseIncremental(e.target.checked);
-                  setError("");
-                }}
-                disabled={isRunning || isLoading}
-                className="w-5 h-5 text-blue-600 bg-slate-700 border-slate-600 rounded focus:ring-2 focus:ring-blue-500 mt-0.5"
-              />
+              <div className="w-10 h-10 rounded-lg bg-blue-500/20 flex items-center justify-center flex-shrink-0">
+                <Play className="w-5 h-5 text-blue-400" />
+              </div>
               <div className="flex-1">
-                <label
-                  htmlFor="incremental-toggle"
-                  className="flex items-center gap-2 cursor-pointer"
-                >
-                  <Zap className="w-5 h-5 text-amber-500" />
-                  <span className="font-semibold text-slate-200 text-base">
-                    Enable Incremental Scraping
-                  </span>
-                </label>
-                <p className="text-sm text-slate-400 mt-1.5">
-                  Automatically creates and runs multiple jobs to scrape all
-                  pages, combining results
+                <h3 className="text-sm font-semibold text-blue-300">
+                  Metadata-Driven Resume Scraping
+                </h3>
+                <p className="text-xs text-slate-400 mt-1">
+                  Intelligent scraping with automatic checkpoint tracking and resume capability
                 </p>
               </div>
             </div>
           </div>
 
-          {/* Regular Pages Input */}
-          {!useIncremental && (
-            <div className="space-y-3">
-              <label className="block text-sm font-semibold text-slate-300">
-                Number of Pages to Scrape
-              </label>
-              <div className="flex items-center gap-3">
-                <input
-                  type="number"
-                  value={pages}
-                  onChange={handlePagesChange}
+          {/* Loading State */}
+          {loadingData && (
+            <div className="flex items-center justify-center py-6">
+              <Loader className="w-5 h-5 text-blue-400 animate-spin mr-2" />
+              <span className="text-sm text-slate-300">Loading project info...</span>
+            </div>
+          )}
+
+          {/* Data Display */}
+          {!loadingData && (
+            <>
+              {/* Project Info */}
+              <div className="bg-slate-900/50 border border-slate-700 rounded-xl p-4 space-y-3">
+                <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Project Details</p>
+                
+                {metadata && (
+                  <div className="space-y-2 text-sm">
+                    {metadata.total_pages && (
+                      <div className="flex justify-between items-center">
+                        <span className="text-slate-400">Total Pages:</span>
+                        <span className="font-semibold text-slate-200">{metadata.total_pages}</span>
+                      </div>
+                    )}
+                    {metadata.total_products && (
+                      <div className="flex justify-between items-center">
+                        <span className="text-slate-400">Expected Records:</span>
+                        <span className="font-semibold text-slate-200">{metadata.total_products.toLocaleString()}</span>
+                      </div>
+                    )}
+                    {metadata.base_url && (
+                      <div className="flex justify-between items-start gap-2">
+                        <span className="text-slate-400">Base URL:</span>
+                        <span className="font-mono text-xs text-blue-300 text-right break-all">{metadata.base_url}</span>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Checkpoint Info */}
+              {checkpoint && (
+                <div className={`border rounded-xl p-4 space-y-3 ${
+                  checkpoint.highest_successful_page > 0
+                    ? "bg-emerald-900/20 border-emerald-700/50"
+                    : "bg-slate-900/50 border-slate-700"
+                }`}>
+                  <p className="text-xs font-semibold uppercase tracking-wider">
+                    {checkpoint.highest_successful_page > 0 ? (
+                      <span className="text-emerald-400">✓ Progress Detected</span>
+                    ) : (
+                      <span className="text-slate-400">No Previous Progress</span>
+                    )}
+                  </p>
+                  
+                  <div className="space-y-2 text-sm">
+                    <div className="flex justify-between items-center">
+                      <span className={checkpoint.highest_successful_page > 0 ? "text-emerald-300" : "text-slate-400"}>
+                        Highest Page Completed:
+                      </span>
+                      <span className="font-semibold text-slate-200">
+                        {checkpoint.highest_successful_page || "None"}
+                      </span>
+                    </div>
+                    
+                    <div className="flex justify-between items-center">
+                      <span className={checkpoint.highest_successful_page > 0 ? "text-emerald-300" : "text-slate-400"}>
+                        Next Page to Scrape:
+                      </span>
+                      <span className="font-semibold text-blue-300">
+                        Page {checkpoint.next_page_to_scrape || 1}
+                      </span>
+                    </div>
+
+                    {checkpoint.total_records_persisted !== undefined && (
+                      <div className="flex justify-between items-center">
+                        <span className="text-slate-400">Records Saved:</span>
+                        <span className="font-semibold text-slate-200">
+                          {checkpoint.total_records_persisted.toLocaleString()}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+
+                  {isComplete && (
+                    <div className="flex items-center gap-2 p-3 bg-emerald-900/30 border border-emerald-700/50 rounded-lg">
+                      <CheckCircle2 className="w-5 h-5 text-emerald-400 flex-shrink-0" />
+                      <span className="text-sm font-medium text-emerald-300">
+                        🎉 Project scraping is complete!
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* System Features */}
+              <div className="bg-slate-900/30 border border-slate-700/50 rounded-xl p-4">
+                <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">System Features</p>
+                <ul className="space-y-2 text-xs text-slate-400">
+                  <li className="flex gap-2">
+                    <span className="text-blue-400 font-bold">•</span>
+                    <span>Automatic checkpoint tracking via database</span>
+                  </li>
+                  <li className="flex gap-2">
+                    <span className="text-blue-400 font-bold">•</span>
+                    <span>Dynamic pagination pattern detection</span>
+                  </li>
+                  <li className="flex gap-2">
+                    <span className="text-blue-400 font-bold">•</span>
+                    <span>Resume from any checkpoint without data loss</span>
+                  </li>
+                  <li className="flex gap-2">
+                    <span className="text-blue-400 font-bold">•</span>
+                    <span>Email alerts on critical failures</span>
+                  </li>
+                </ul>
+              </div>
+
+              {/* Error Display */}
+              {error && (
+                <div className="bg-red-900/20 border border-red-700/50 rounded-xl p-4 space-y-2">
+                  <div className="flex items-start gap-3">
+                    <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" />
+                    <div className="flex-1">
+                      <p className="text-sm font-semibold text-red-300">Error</p>
+                      <p className="text-xs text-red-200 mt-1">{error}</p>
+                      
+                      {/* Diagnostic suggestions */}
+                      {error.includes('404') && (
+                        <p className="text-xs text-red-300 mt-2 p-2 bg-red-900/30 rounded">
+                          💡 Project metadata not found. Try refreshing or check METADATA_DRIVEN_TROUBLESHOOTING.md
+                        </p>
+                      )}
+                      
+                      {error.includes('timeout') && (
+                        <p className="text-xs text-red-300 mt-2 p-2 bg-red-900/30 rounded">
+                          💡 Backend is slow. Check: backend logs | database connection | try again in 10 seconds
+                        </p>
+                      )}
+                      
+                      {error.includes('unreachable') && (
+                        <p className="text-xs text-red-300 mt-2 p-2 bg-red-900/30 rounded">
+                          💡 Backend not running. Start with: cd backend && python -m src.api.api_server
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Action Buttons */}
+              <div className="flex gap-3 justify-end pt-4 border-t border-slate-700/50">
+                <button
+                  onClick={onClose}
                   disabled={isRunning || isLoading}
-                  className="flex-1 px-4 py-3 bg-slate-900/50 border border-slate-600 rounded-xl text-slate-200 font-medium focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:bg-slate-800 disabled:text-slate-500 transition-all"
-                  placeholder="Enter number of pages"
-                />
-                <span className="text-sm text-slate-400 font-medium px-3 py-3 bg-slate-800/50 rounded-lg border border-slate-700">
-                  pages
-                </span>
-              </div>
-              <p className="text-xs text-slate-500">
-                Specify how many pages to scrape in a single run.
-              </p>
-            </div>
-          )}
+                  className="px-6 py-3 text-slate-300 font-semibold border border-slate-600 rounded-xl hover:bg-slate-700/50 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed transition-all duration-200"
+                >
+                  Cancel
+                </button>
 
-          {/* Incremental Scraping Inputs */}
-          {useIncremental && (
-            <div className="space-y-5 bg-gradient-to-br from-amber-900/20 to-orange-900/20 border border-amber-700/30 rounded-xl p-5">
-              <div className="space-y-3">
-                <label className="block text-sm font-semibold text-slate-300">
-                  Pages per Iteration
-                </label>
-                <div className="flex items-center gap-3">
-                  <input
-                    type="number"
-                    value={pages}
-                    onChange={handlePagesChange}
+                {canResume ? (
+                  <button
+                    onClick={handleResume}
                     disabled={isRunning || isLoading}
-                    className="flex-1 px-4 py-3 bg-slate-900/50 border border-amber-600/50 rounded-xl text-slate-200 font-semibold focus:outline-none focus:ring-2 focus:ring-amber-500 focus:border-transparent disabled:bg-slate-800 disabled:text-slate-500 transition-all"
-                    placeholder="e.g., 5"
-                  />
-                  <span className="text-sm text-slate-300 font-medium px-3 py-3 bg-slate-800/50 rounded-lg border border-slate-700">
-                    pages/run
-                  </span>
-                </div>
-                <p className="text-xs text-slate-400">
-                  How many pages to scrape per ParseHub project iteration
-                </p>
+                    className="px-8 py-3 bg-gradient-to-r from-emerald-600 to-emerald-700 hover:from-emerald-700 hover:to-emerald-800 disabled:from-slate-700 disabled:to-slate-700 text-white font-semibold rounded-xl flex items-center gap-2 disabled:cursor-not-allowed transition-all duration-200 shadow-lg shadow-emerald-500/25"
+                  >
+                    {isRunning ? (
+                      <>
+                        <Loader className="w-4 h-4 animate-spin" />
+                        Resuming...
+                      </>
+                    ) : (
+                      <>
+                        <Play className="w-4 h-4" />
+                        Resume Scraping
+                      </>
+                    )}
+                  </button>
+                ) : (
+                  <button
+                    onClick={handleStart}
+                    disabled={isRunning || isLoading || isComplete}
+                    className="px-8 py-3 bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 disabled:from-slate-700 disabled:to-slate-700 text-white font-semibold rounded-xl flex items-center gap-2 disabled:cursor-not-allowed transition-all duration-200 shadow-lg shadow-blue-500/25"
+                  >
+                    {isRunning ? (
+                      <>
+                        <Loader className="w-4 h-4 animate-spin" />
+                        Starting...
+                      </>
+                    ) : isComplete ? (
+                      <>
+                        <CheckCircle2 className="w-4 h-4" />
+                        Complete
+                      </>
+                    ) : (
+                      <>
+                        <Play className="w-4 h-4" />
+                        Start Scraping
+                      </>
+                    )}
+                  </button>
+                )}
               </div>
 
-              <div className="space-y-3">
-                <label className="block text-sm font-semibold text-slate-300">
-                  Total Pages Target
-                </label>
-                <div className="flex items-center gap-3">
-                  <input
-                    type="number"
-                    value={totalPages}
-                    onChange={handleTotalPagesChange}
-                    disabled={isRunning || isLoading}
-                    className="flex-1 px-4 py-3 bg-slate-900/50 border border-amber-600/50 rounded-xl text-slate-200 font-semibold focus:outline-none focus:ring-2 focus:ring-amber-500 focus:border-transparent disabled:bg-slate-800 disabled:text-slate-500 transition-all"
-                    placeholder="e.g., 50"
-                  />
-                  <span className="text-sm text-slate-300 font-medium px-3 py-3 bg-slate-800/50 rounded-lg border border-slate-700">
-                    pages total
-                  </span>
-                </div>
-                <p className="text-xs text-slate-400">
-                  Total pages you want to scrape (system will create{" "}
-                  {pages && totalPages
-                    ? Math.ceil(parseInt(totalPages) / parseInt(pages))
-                    : "?"}{" "}
-                  iterations)
-                </p>
-              </div>
-
-              <div className="bg-slate-900/50 border border-amber-600/30 rounded-xl p-4">
-                <p className="text-sm font-semibold text-amber-300 mb-2">
-                  📊 Scraping Plan
-                </p>
-                <p className="text-sm text-slate-300">
-                  Will create{" "}
-                  <strong className="text-amber-400">
-                    {pages && totalPages
-                      ? Math.ceil(parseInt(totalPages) / parseInt(pages))
-                      : "?"}
-                  </strong>{" "}
-                  automatic runs of{" "}
-                  <strong className="text-amber-400">
-                    {pages || "?"} pages each
-                  </strong>{" "}
-                  to reach{" "}
-                  <strong className="text-amber-400">
-                    {totalPages || "?"} pages
-                  </strong>
-                </p>
-              </div>
-            </div>
+              {/* Auto-Complete Status */}
+              <AutoCompleteStatus 
+                projectToken={projectToken}
+                refreshInterval={10}
+                className="mt-4"
+              />
+            </>
           )}
-
-          {error && (
-            <div className="flex items-start gap-3 p-4 bg-red-900/20 border border-red-700/50 rounded-xl">
-              <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" />
-              <span className="text-sm text-red-300 font-medium">{error}</span>
-            </div>
-          )}
-
-          {!useIncremental && (
-            <div className="bg-blue-900/20 border border-blue-700/30 rounded-xl p-4">
-              <p className="text-sm text-blue-300">
-                <strong className="text-blue-400">
-                  🔄 Auto-Recovery Enabled:
-                </strong>{" "}
-                If the scraping stops before reaching all {pages || "?"} pages,
-                you can resume without losing progress.
-              </p>
-            </div>
-          )}
-
-          {useIncremental && (
-            <div className="bg-amber-900/20 border border-amber-700/30 rounded-xl p-4">
-              <p className="text-sm text-amber-300">
-                <strong className="text-amber-400">
-                  ⚡ Automated Pagination:
-                </strong>{" "}
-                URL pattern will be detected automatically. New projects will be
-                created for each iteration and combined results will be saved.
-              </p>
-            </div>
-          )}
-
-          <div className="flex gap-3 justify-end pt-4 border-t border-slate-700/50">
-            <button
-              onClick={onClose}
-              disabled={isRunning || isLoading}
-              className="px-6 py-3 text-slate-300 font-semibold border border-slate-600 rounded-xl hover:bg-slate-700/50 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed transition-all duration-200"
-            >
-              Cancel
-            </button>
-            <button
-              onClick={handleRun}
-              disabled={isRunning || isLoading}
-              className={`px-6 py-3 text-white font-semibold rounded-xl flex items-center gap-2 disabled:cursor-not-allowed transition-all duration-200 shadow-lg ${useIncremental
-                ? "bg-gradient-to-r from-amber-600 to-orange-600 hover:from-amber-700 hover:to-orange-700 disabled:from-slate-700 disabled:to-slate-700 shadow-amber-500/25"
-                : "bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 disabled:from-slate-700 disabled:to-slate-700 shadow-blue-500/25"
-                }`}
-            >
-              <Play className="w-4 h-4" />
-              {isRunning || isLoading
-                ? "Starting..."
-                : useIncremental
-                  ? "Start Incremental Scrape"
-                  : "Start Run"}
-            </button>
-          </div>
         </div>
       </Modal>
 
-      <ProgressModal
-        isOpen={showProgress}
-        onClose={() => setShowProgress(false)}
-        sessionId={sessionId || 0}
-        projectName={projectTitle}
-      />
+      {/* Metadata Progress Modal */}
+      {showBatchProgress && batchRunToken && (
+        <MetadataProgressModal
+          isOpen={showBatchProgress}
+          onClose={() => {
+            setShowBatchProgress(false);
+            onClose();
+          }}
+          projectToken={projectToken}
+          projectTitle={projectTitle}
+          metadata={metadata}
+          startingPage={checkpoint?.next_start_page || 1}
+          runToken={batchRunToken}
+        />
+      )}
     </>
   );
 }

@@ -41,7 +41,7 @@ export default function ColumnStatisticsModal({
     setError(null);
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 30000);
+      const timeoutId = setTimeout(() => controller.abort(), 120000);
 
       try {
         const response = await fetch(
@@ -52,11 +52,11 @@ export default function ColumnStatisticsModal({
           },
         );
 
-        if (!response.status || response.status >= 400) {
+        if (!response.ok || response.status >= 400) {
           throw new Error(`API error: ${response.status}`);
         }
 
-        const result = response.data;
+        const result = await response.json();
 
         if (!result.csv_data) {
           setError(
@@ -80,7 +80,7 @@ export default function ColumnStatisticsModal({
       }
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") {
-        setError("Request timed out. The server might be busy.");
+        setError("Request timed out (took longer than 120 seconds). The dataset might be too large.");
       } else {
         setError(err instanceof Error ? err.message : "Failed to fetch data");
       }

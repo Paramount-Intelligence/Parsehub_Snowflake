@@ -4,15 +4,23 @@ Pagination Service - Handles pagination detection, URL generation, and recovery
 
 import re
 import json
+import sys
 from datetime import datetime
 from typing import Dict, Optional, Tuple
+from pathlib import Path
+
+root_dir = Path(__file__).parent.parent.parent  # backend/
+if str(root_dir) not in sys.path:
+    sys.path.insert(0, str(root_dir))
+
+from src.models.database import ParseHubDatabase
 
 
 class PaginationService:
     """Service for managing pagination and automatic recovery"""
     
-    def __init__(self, db_path: str = "parsehub.db"):
-        self.db_path = db_path
+    def __init__(self):
+        self.db = ParseHubDatabase()
     
     def extract_page_number(self, url: str) -> int:
         """
@@ -86,29 +94,49 @@ class PaginationService:
                 'pages_remaining': int
             }
         """
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
-        # Get last page number from data
-        cursor.execute('''
-            SELECT MAX(CAST(json_extract(data, '$.page_number') AS INTEGER)) as last_page
-            FROM scraped_data 
-            WHERE project_id = %s
-        ''', (project_id,))
-        
-        result = cursor.fetchone()
-        last_page = result['last_page'] or 1 if result else 1
-        
-        # Get total data count
-        cursor.execute('''
-            SELECT COUNT(*) as total FROM scraped_data 
-            WHERE project_id = %s
-        ''', (project_id,))
-        
-        total_count = cursor.fetchone()['total'] or 0
-        
-        conn.close()
+        try:
+            conn = self.db.connect()
+            if not conn:
+                return {
+                    'needs_recovery': True,
+                    'last_page_scraped': 0,
+                    'target_pages': target_pages,
+                    'total_data_count': 0,
+                    'pages_remaining': target_pages
+                }
+            cursor = conn.cursor()
+            
+            # Get last page number from data
+            cursor.execute('''
+                SELECT MAX(CAST(json_extract(data, '$.page_number') AS INTEGER)) as last_page
+                FROM scraped_data 
+                WHERE project_id = %s
+            ''', (project_id,))
+            
+            result = cursor.fetchone()
+            last_page = (result.get('last_page') if isinstance(result, dict) else result[0]) if result else 0
+            if not last_page:
+                last_page = 0
+            
+            # Get total data count
+            cursor.execute('''
+                SELECT COUNT(*) as total FROM scraped_data 
+                WHERE project_id = %s
+            ''', (project_id,))
+            
+            total_result = cursor.fetchone()
+            total_count = (total_result.get('total') if isinstance(total_result, dict) else total_result[0]) if total_result else 0
+            
+            self.db.disconnect()
+        except Exception as e:
+            print(f"[ERROR] check_pagination_needed failed: {e}", file=sys.stderr)
+            return {
+                'needs_recovery': True,
+                'last_page_scraped': 0,
+                'target_pages': target_pages,
+                'total_data_count': 0,
+                'pages_remaining': target_pages
+            }
         
         return {
             'needs_recovery': last_page < target_pages,
@@ -137,22 +165,27 @@ class PaginationService:
     def record_scraping_progress(self, project_id: int, page_number: int, 
                                 data_count: int, items_per_minute: float) -> None:
         """Record scraping progress checkpoint"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            INSERT INTO run_checkpoints
-            (run_id, snapshot_timestamp, item_count_at_time, items_per_minute)
-            VALUES (
-                (SELECT id FROM runs WHERE project_id = %s ORDER BY created_at DESC LIMIT 1),
-                CURRENT_TIMESTAMP,
-                %s,
-                %s
-            )
-        ''', (project_id, data_count, items_per_minute))
-        
-        conn.commit()
-        conn.close()
+        try:
+            conn = self.db.connect()
+            if not conn:
+                return
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO run_checkpoints
+                (run_id, snapshot_timestamp, item_count_at_time, items_per_minute)
+                VALUES (
+                    (SELECT id FROM runs WHERE project_id = %s ORDER BY created_at DESC LIMIT 1),
+                    CURRENT_TIMESTAMP,
+                    %s,
+                    %s
+                )
+            ''', (project_id, data_count, items_per_minute))
+            
+            conn.commit()
+            self.db.disconnect()
+        except Exception as e:
+            print(f"[ERROR] record_scraping_progress failed: {e}", file=sys.stderr)
 
 
 class PaginationDetector:
@@ -199,3 +232,69 @@ class PaginationDetector:
             consistency = 0.0
         
         return int(avg), max(0, consistency)
+
+
+# ===== BATCH URL GENERATION (NEW) =====
+
+class BatchUrlGenerator:
+    """Generate batch URLs for chunk-based pagination"""
+    
+    BATCH_SIZE = 10  # Default batch size
+    
+    @staticmethod
+    def generate_batch_urls(base_url: str, start_page: int, batch_size: int = BATCH_SIZE) -> list:
+        """
+        Generate a batch of URLs for consecutive pages
+        
+        Args:
+            base_url: Base URL or template URL (can contain page number parameter)
+            start_page: Starting page number (1-indexed)
+            batch_size: Number of URLs to generate (default 10)
+        
+        Returns:
+            List of URLs for pages [start_page, start_page+batch_size)
+        """
+        urls = []
+        service = PaginationService()
+        
+        for i in range(batch_size):
+            page_num = start_page + i
+            
+            # Use existing method to generate URL for this page
+            if i == 0:
+                # First page - use base_url directly if it already has a page param
+                url = base_url
+            else:
+                # Subsequent pages - generate URL
+                url = service.generate_next_page_url(base_url, start_page + i - 1)
+            
+            urls.append(url)
+        
+        return urls
+    
+    @staticmethod
+    def validate_batch_urls(urls: list) -> bool:
+        """
+        Validate that batch URLs are properly differentiated
+        
+        Returns:
+            True if all URLs in batch are unique (good pagination)
+        """
+        return len(urls) == len(set(urls))
+    
+    @staticmethod
+    def extract_page_numbers_from_batch(urls: list) -> list:
+        """
+        Extract page numbers from batch of URLs
+        
+        Returns:
+            List of page numbers (or None if not detected)
+        """
+        service = PaginationService()
+        page_numbers = []
+        
+        for url in urls:
+            page_num = service.extract_page_number(url)
+            page_numbers.append(page_num)
+        
+        return page_numbers

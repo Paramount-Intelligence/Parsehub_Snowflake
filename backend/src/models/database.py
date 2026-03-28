@@ -1,10 +1,28 @@
 import json
 import os
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 from typing import List, Dict, Any, Optional
 import threading
+import time
+import logging
+
+
+def stable_run_id(run_token: str) -> int:
+    """Deterministic RUNS.id for Snowflake (matches auto_sync_service inserts)."""
+    if not run_token:
+        return 0
+    return int(hashlib.md5(run_token.encode()).hexdigest(), 16) % (10 ** 10)
+
+
+def stable_scraped_data_id(run_token: str, index: int) -> int:
+    """Deterministic scraped_data.id per row."""
+    s = f"{run_token}:{index}"
+    return int(hashlib.md5(s.encode()).hexdigest(), 16) % (10 ** 12)
+
+logger = logging.getLogger(__name__)
 
 # Snowflake support (required)
 try:
@@ -22,6 +40,18 @@ if dotenv_path.exists():
     load_dotenv(dotenv_path)
 else:
     load_dotenv()
+
+# Module-level cache for metadata columns (prevents N+1 queries)
+_metadata_columns_cache = None
+_metadata_columns_cache_time = 0
+METADATA_COLUMNS_CACHE_TTL = 300  # 5 minutes cache
+
+def invalidate_metadata_columns_cache():
+    """Invalidate the metadata columns cache when schema changes."""
+    global _metadata_columns_cache, _metadata_columns_cache_time
+    _metadata_columns_cache = None
+    _metadata_columns_cache_time = 0
+    logger.info("[DB] Metadata columns cache invalidated")
 
 
 
@@ -738,6 +768,281 @@ class ParseHubDatabase:
         self.disconnect()
 
         return run_id
+
+    def ensure_run_started(
+        self,
+        project_id: int,
+        run_token: str,
+        status: str = 'running',
+        pages_scraped: int = 0,
+        is_continuation: Optional[bool] = None,
+    ) -> int:
+        """
+        Insert or update a run row in Snowflake when a run is started from the app.
+        Uses deterministic id so inserts work without IDENTITY on RUNS.id.
+        """
+        if not run_token or not project_id:
+            return 0
+        rid = stable_run_id(run_token)
+        conn = self.connect()
+        cursor = self.cursor()
+        try:
+            cursor.execute(
+                'SELECT id FROM runs WHERE run_token = %s',
+                (run_token,),
+            )
+            existing = cursor.fetchone()
+            if existing:
+                if is_continuation is not None:
+                    cursor.execute(
+                        '''
+                        UPDATE runs SET status = %s, pages_scraped = %s,
+                        is_continuation = %s, updated_at = CURRENT_TIMESTAMP()
+                        WHERE run_token = %s
+                        ''',
+                        (status, pages_scraped, is_continuation, run_token),
+                    )
+                else:
+                    cursor.execute(
+                        '''
+                        UPDATE runs SET status = %s, pages_scraped = %s,
+                        updated_at = CURRENT_TIMESTAMP()
+                        WHERE run_token = %s
+                        ''',
+                        (status, pages_scraped, run_token),
+                    )
+            else:
+                if is_continuation is not None:
+                    cursor.execute(
+                        '''
+                        INSERT INTO runs (
+                            id, project_id, run_token, status, pages_scraped,
+                            start_time, is_continuation, created_at, updated_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP(), %s, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())
+                        ''',
+                        (rid, project_id, run_token, status, pages_scraped, is_continuation),
+                    )
+                else:
+                    cursor.execute(
+                        '''
+                        INSERT INTO runs (
+                            id, project_id, run_token, status, pages_scraped,
+                            start_time, created_at, updated_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())
+                        ''',
+                        (rid, project_id, run_token, status, pages_scraped),
+                    )
+            conn.commit()
+            return rid
+        finally:
+            self.disconnect()
+
+    def update_run_progress(
+        self,
+        run_token: str,
+        pages_scraped: int,
+        status: Optional[str] = None,
+    ) -> None:
+        """Update live pages / status while ParseHub run is executing."""
+        if not run_token:
+            return
+        conn = self.connect()
+        cursor = self.cursor()
+        try:
+            if status:
+                cursor.execute(
+                    '''
+                    UPDATE runs SET pages_scraped = %s, status = %s, updated_at = CURRENT_TIMESTAMP()
+                    WHERE run_token = %s
+                    ''',
+                    (pages_scraped, status, run_token),
+                )
+            else:
+                cursor.execute(
+                    '''
+                    UPDATE runs SET pages_scraped = %s, updated_at = CURRENT_TIMESTAMP()
+                    WHERE run_token = %s
+                    ''',
+                    (pages_scraped, run_token),
+                )
+            conn.commit()
+        finally:
+            self.disconnect()
+
+    def mark_run_terminal(
+        self,
+        run_token: str,
+        status: str,
+        records_count: Optional[int] = None,
+    ) -> None:
+        """Mark run complete / failed / cancelled with end time."""
+        if not run_token:
+            return
+        conn = self.connect()
+        cursor = self.cursor()
+        try:
+            if records_count is not None:
+                cursor.execute(
+                    '''
+                    UPDATE runs SET status = %s, records_count = %s,
+                    end_time = CURRENT_TIMESTAMP(), updated_at = CURRENT_TIMESTAMP()
+                    WHERE run_token = %s
+                    ''',
+                    (status, records_count, run_token),
+                )
+            else:
+                cursor.execute(
+                    '''
+                    UPDATE runs SET status = %s,
+                    end_time = CURRENT_TIMESTAMP(), updated_at = CURRENT_TIMESTAMP()
+                    WHERE run_token = %s
+                    ''',
+                    (status, run_token),
+                )
+            conn.commit()
+        finally:
+            self.disconnect()
+
+    def insert_scraped_rows_for_run(
+        self,
+        run_token: str,
+        project_id: int,
+        records: List[Dict],
+    ) -> int:
+        """
+        Store API result rows in scraped_data (Snowflake). One row per record JSON.
+
+        Uses the actual runs.id from the database (FK). Some code paths create runs
+        with IDs that differ from stable_run_id(); inserting with the wrong id
+        fails the FK and previously resulted in zero Snowflake rows.
+        """
+        logger.info(f'[DB] insert_scraped_rows_for_run START: run_token={run_token[:12] if run_token else None}... project_id={project_id} records_count={len(records) if records else 0}')
+        
+        if not records or not run_token:
+            logger.warning(f'[DB] insert_scraped_rows_for_run: ABORT - no records or no run_token')
+            return 0
+        dict_rows = [r for r in records if isinstance(r, dict)]
+        logger.info(f'[DB] insert_scraped_rows_for_run: filtered to {len(dict_rows)} dict rows')
+        if not dict_rows:
+            logger.warning(f'[DB] insert_scraped_rows_for_run: ABORT - no dict rows after filtering. Sample record types: {[type(r).__name__ for r in records[:5]]}')
+            return 0
+        conn = self.connect()
+        cursor = self.cursor()
+        inserted = 0
+        rid = None
+        try:
+            # Lookup run_id
+            logger.info(f'[DB] Looking up runs.id for run_token={run_token[:12]}...')
+            cursor.execute(
+                'SELECT id FROM runs WHERE run_token = %s',
+                (run_token,),
+            )
+            row = cursor.fetchone()
+            if row:
+                if isinstance(row, dict):
+                    rid = row.get('id') or row.get('ID')
+                else:
+                    rid = row[0]
+                logger.info(f'[DB] Found existing run_id={rid}')
+            else:
+                rid = stable_run_id(run_token)
+                logger.info(f'[DB] No existing run, creating with stable_run_id={rid}')
+                cursor.execute(
+                    '''
+                    INSERT INTO runs (
+                        id, project_id, run_token, status, pages_scraped,
+                        start_time, created_at, updated_at
+                    )
+                    VALUES (%s, %s, %s, 'completed', 0,
+                            CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())
+                    ''',
+                    (rid, project_id, run_token),
+                )
+                logger.info(f'[DB] Created run row with id={rid}')
+
+            # Delete existing rows
+            logger.info(f'[DB] Deleting existing scraped_data rows for run_id={rid} project_id={project_id}')
+            cursor.execute(
+                'DELETE FROM scraped_data WHERE run_id = %s AND project_id = %s',
+                (rid, project_id),
+            )
+            deleted = cursor.rowcount if hasattr(cursor, 'rowcount') else 'unknown'
+            logger.info(f'[DB] Deleted {deleted} existing rows')
+
+            # Insert new rows
+            logger.info(f'[DB] Inserting {len(dict_rows)} rows into scraped_data...')
+            for i, rec in enumerate(dict_rows):
+                row_id = stable_scraped_data_id(run_token, i)
+                payload = json.dumps(rec, default=str)
+                try:
+                    cursor.execute(
+                        '''
+                        INSERT INTO scraped_data (id, run_id, project_id, data_key, data_value, created_at)
+                        VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP())
+                        ''',
+                        (row_id, rid, project_id, 'record', payload),
+                    )
+                    inserted += 1
+                except Exception as row_e:
+                    logger.error(f'[DB] scraped_data insert FAILED row {i}: {row_e}', exc_info=True)
+            
+            conn.commit()
+            logger.info(f'[DB] insert_scraped_rows_for_run: COMMITTED {inserted} rows')
+            if inserted:
+                logger.info(
+                    f'[DB] scraped_data: SUCCESS - inserted {inserted} row(s) for project_id={project_id} run_token={run_token[:12]}...'
+                )
+            else:
+                logger.error(f'[DB] scraped_data: ZERO rows inserted for project_id={project_id} run_token={run_token[:12]}...')
+        except Exception as e:
+            logger.error(f'[DB] insert_scraped_rows_for_run CRITICAL ERROR: {e}', exc_info=True)
+            try:
+                conn.rollback()
+                logger.info('[DB] Rolled back transaction')
+            except:
+                pass
+            inserted = 0
+        finally:
+            self.disconnect()
+            logger.info(f'[DB] insert_scraped_rows_for_run END: inserted={inserted}')
+        return inserted
+
+    def get_project_id_by_token(self, project_token: str) -> Optional[int]:
+        conn = self.connect()
+        cursor = self.cursor()
+        try:
+            cursor.execute(
+                'SELECT id FROM projects WHERE token = %s',
+                (project_token,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            if isinstance(row, dict):
+                return row.get('id')
+            return row[0]
+        finally:
+            self.disconnect()
+
+    def get_latest_run_row_for_project(self, project_id: int) -> Optional[Dict]:
+        conn = self.connect()
+        cursor = self.cursor()
+        try:
+            cursor.execute(
+                '''
+                SELECT run_token, status, pages_scraped, records_count, start_time, end_time, updated_at
+                FROM runs WHERE project_id = %s
+                ORDER BY COALESCE(updated_at, created_at, start_time) DESC
+                LIMIT 1
+                ''',
+                (project_id,),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        finally:
+            self.disconnect()
 
     def store_scraped_data(self, run_id: int, project_id: int = None, data: dict | list = None):
         """Store scraped data from JSON"""
@@ -2035,10 +2340,25 @@ class ParseHubDatabase:
 
     def get_metadata_table_columns(self, auto_disconnect=True) -> list:
         """Return column names of the metadata table from Snowflake information_schema.
-        
+        Results are cached for 5 minutes to prevent N+1 query issues.
+
         Args:
             auto_disconnect: If True, disconnect after getting columns. Set to False if called within another method
         """
+        global _metadata_columns_cache, _metadata_columns_cache_time
+
+        now = time.time()
+
+        # Check cache first
+        if _metadata_columns_cache is not None:
+            cache_age = now - _metadata_columns_cache_time
+            if cache_age < METADATA_COLUMNS_CACHE_TTL:
+                logger.debug(f"[DB] Using cached metadata columns (age: {cache_age:.1f}s)")
+                return _metadata_columns_cache
+            else:
+                logger.debug(f"[DB] Metadata columns cache expired (age: {cache_age:.1f}s)")
+
+        # Cache miss - fetch from database
         try:
             self.connect()
             cursor = self.cursor()
@@ -2064,12 +2384,17 @@ class ParseHubDatabase:
                     val = r[0] if isinstance(r, (list, tuple)) and r else None
                 if val:
                     out.append(val)
-            print(f"[DB] get_metadata_table_columns returned: {out}")
+
+            # Update cache
+            _metadata_columns_cache = out
+            _metadata_columns_cache_time = now
+
+            logger.info(f"[DB] Metadata columns cached: {len(out)} columns (TTL: {METADATA_COLUMNS_CACHE_TTL}s)")
             if auto_disconnect:
                 self.disconnect()
             return out
         except Exception as e:
-            print(f"Error getting metadata columns: {e}")
+            logger.error(f"Error getting metadata columns: {e}")
             import traceback
             traceback.print_exc()
             if auto_disconnect:

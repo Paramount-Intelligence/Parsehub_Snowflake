@@ -1,14 +1,13 @@
 import { getApiBaseUrl, getApiHeaders } from "@/lib/apiBase";
 import { NextRequest, NextResponse } from 'next/server'
 
-const BACKEND_URL = getApiBaseUrl();
-
 export async function GET(
   _request: NextRequest,
-  { params }: { params: { token: string } }
+  { params }: { params: Promise<{ token: string }> }
 ) {
   try {
-    const { token } = params
+    const BACKEND_URL = getApiBaseUrl();
+    const { token } = await params
 
     const response = await fetch(
       `${BACKEND_URL}/api/projects/${token}/analytics`,

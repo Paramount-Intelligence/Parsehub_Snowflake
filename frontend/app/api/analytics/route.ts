@@ -1,7 +1,4 @@
 import { NextRequest, NextResponse } from 'next/server'
-import * as path from 'path'
-import * as fs from 'fs'
-import { execSync } from 'child_process'
 import axios from 'axios'
 
 const API_KEY = process.env.PARSEHUB_API_KEY || ''
@@ -49,315 +46,108 @@ function parseCSV(csvText: string): any[] {
   return records
 }
 
-// Store analytics data to SQLite database SYNCHRONOUSLY
+// Store analytics data to database via backend API
 async function storeAnalyticsDataToDB(
   projectToken: string,
   runToken: string,
   analyticsData: any,
   records: any[],
   csvData?: string
-): Promise<{ success: boolean; message: string; error?: string }> {
+): Promise<{ success: boolean; message: string; error?: string; records_stored?: number }> {
   try {
-    console.log(`[DB STORE] Starting storage for project ${projectToken}, records: ${records.length}`)
+    console.log(`[DB STORE] Storing data for project ${projectToken} via backend API, records: ${records.length}`)
 
-    const projectRoot = path.resolve(process.cwd(), '..')
-    const backendDir = path.join(projectRoot, 'backend')
-    const pythonExe = path.join(projectRoot, '.venv', 'Scripts', 'python.exe')
+    // Import getApiBaseUrl at the top of the file
+    const { getApiBaseUrl, getApiHeaders } = await import('@/lib/apiBase')
+    const backendUrl = getApiBaseUrl()
 
-    if (!fs.existsSync(pythonExe)) {
-      const msg = `Python exe not found at ${pythonExe}`
-      console.error(`[DB STORE] ${msg}`)
-      return { success: false, message: msg, error: msg }
+    const response = await axios.post(
+      `${backendUrl}/api/store-analytics`,
+      {
+        project_token: projectToken,
+        run_token: runToken,
+        analytics_data: analyticsData,
+        records: records,
+        csv_data: csvData || null,
+      },
+      {
+        headers: getApiHeaders(),
+        timeout: 60000, // 60 second timeout for large datasets
+      }
+    )
+
+    const result = response.data
+
+    if (result.success) {
+      console.log(`✅ [DB STORE] SUCCESS: Data stored for ${projectToken}, records: ${result.records_stored}`)
+    } else {
+      console.error(`❌ [DB STORE] FAILED: ${result.error}`)
     }
 
-    if (!fs.existsSync(backendDir)) {
-      const msg = `Backend dir not found at ${backendDir}`
-      console.error(`[DB STORE] ${msg}`)
-      return { success: false, message: msg, error: msg }
-    }
+    return result
 
-    // Create a temporary JSON file with the data to store
-    // Custom replacer to handle non-serializable objects
-    const jsonReplacer = (_key: any, value: any) => {
-      if (value instanceof Date) {
-        return value.toISOString()
-      }
-      if (typeof value === 'function') {
-        return undefined
-      }
-      if (typeof value === 'bigint') {
-        return value.toString()
-      }
-      return value
-    }
-
-
-    const dataToStore = {
-      project_token: projectToken,
-      run_token: runToken,
-      analytics_data: analyticsData,
-      records: records,
-      csv_data: csvData || null,
-    }
-
-    const tempFile = path.join(backendDir, `.analytics_temp_${projectToken}_${Date.now()}.json`)
-    console.log(`[DB STORE] Writing temp file: ${tempFile}`)
-
-    try {
-      const jsonString = JSON.stringify(dataToStore, jsonReplacer)
-      if (!jsonString || jsonString.length === 0) {
-        throw new Error('JSON serialization produced empty output')
-      }
-      fs.writeFileSync(tempFile, jsonString)
-    } catch (e) {
-      const errMsg = e instanceof Error ? e.message : String(e)
-      console.error(`[DB STORE] JSON serialization error: ${errMsg}`)
-      throw e
-    }
-
-    const fileExists = fs.existsSync(tempFile)
-    const fileSize = fileExists ? fs.statSync(tempFile).size : 0
-    console.log(`[DB STORE] Temp file written: ${fileExists ? `verified (${fileSize} bytes)` : 'FAILED'}`)
-
-    try {
-      const pythonScript = `
-import sys
-import json
-import os
-
-sys.path.insert(0, '.')
-from database import ParseHubDatabase
-
-def main():
-    try:
-        # Get file path from command line argument
-        if len(sys.argv) < 2:
-            raise ValueError("No temp file path provided")
-        
-        temp_file = sys.argv[1]
-        
-        # Validate file exists and has content
-        if not os.path.exists(temp_file):
-            raise FileNotFoundError(f"Temp file not found: {temp_file}")
-        
-        file_size = os.path.getsize(temp_file)
-        if file_size == 0:
-            raise ValueError(f"Temp file is empty: {temp_file}")
-        
-        print(f"[PYTHON] Reading temp file: {temp_file} ({file_size} bytes)", file=sys.stderr)
-        
-        # Read and parse JSON with error handling
-        try:
-            with open(temp_file, 'r', encoding='utf-8') as f:
-                content = f.read()
-                if not content.strip():
-                    raise ValueError("File content is empty")
-                data = json.loads(content)
-        except json.JSONDecodeError as je:
-            raise ValueError(f"JSON decode error: {str(je)}")
-        
-        print(f"[PYTHON] Loaded data with {len(data.get('records', []))} records", file=sys.stderr)
-        
-        # Store to database
-        db = ParseHubDatabase()
-        try:
-            result = db.store_analytics_data(
-                data['project_token'],
-                data['run_token'],
-                data['analytics_data'],
-                data['records'],
-                data.get('csv_data')
-            )
-            
-            print(f"[PYTHON] Store result: {result}", file=sys.stderr)
-            
-            if result:
-                print(json.dumps({
-                    "success": True,
-                    "message": "Data stored successfully",
-                    "records_stored": len(data.get('records', []))
-                }))
-            else:
-                print(json.dumps({
-                    "success": False,
-                    "error": "Database storage returned False"
-                }))
-        finally:
-            db.disconnect()
-    
-    except Exception as e:
-        import traceback
-        error_msg = str(e)
-        print(f"[PYTHON] ERROR: {error_msg}", file=sys.stderr)
-        print(traceback.format_exc(), file=sys.stderr)
-        print(json.dumps({
-            "success": False,
-            "error": error_msg
-        }))
-        sys.exit(1)
-
-if __name__ == '__main__':
-    main()
-`
-
-      console.log(`[DB STORE] Executing Python script with file: ${tempFile}...`)
-      const output = execSync(
-        `"${pythonExe}" -c "${pythonScript.replace(/"/g, '\\"')}" "${tempFile}"`,
-        {
-          cwd: backendDir,
-          encoding: 'utf-8',
-          maxBuffer: 100 * 1024 * 1024,
-          stdio: ['pipe', 'pipe', 'pipe'],
-          timeout: 30000,
-        }
-      )
-
-      if (!output || output.trim().length === 0) {
-        throw new Error('Python script produced no output')
-      }
-
-      console.log(`[DB STORE] Python output: ${output}`)
-      let result
-      try {
-        result = JSON.parse(output)
-      } catch (e) {
-        console.error(`[DB STORE] Failed to parse Python output as JSON: ${output}`)
-        throw new Error(`Invalid JSON from Python: ${output.substring(0, 100)}`)
-      }
-
-      if (result.success) {
-        console.log(`✅ [DB STORE] SUCCESS: Data stored for ${projectToken}, records: ${result.records_stored}`)
-      } else {
-        console.error(`❌ [DB STORE] FAILED: ${result.error}`)
-      }
-
-      // Clean up temp file
-      try {
-        if (fs.existsSync(tempFile)) {
-          fs.unlinkSync(tempFile)
-          console.log(`[DB STORE] Temp file cleaned up`)
-        }
-      } catch (e) {
-        console.warn(`[DB STORE] Cleanup warning:`, e instanceof Error ? e.message : e)
-      }
-
-      return result
-    } finally {
-      try {
-        if (fs.existsSync(tempFile)) {
-          fs.unlinkSync(tempFile)
-        }
-      } catch (e) {
-        // Ignore final cleanup errors
-      }
-    }
   } catch (error) {
     const errMsg = error instanceof Error ? error.message : String(error)
     console.error(`❌ [DB STORE] Exception: ${errMsg}`)
+    
+    // Handle axios errors with more detail
+    if (axios.isAxiosError(error)) {
+      const serverError = error.response?.data?.error || error.message
+      console.error(`❌ [DB STORE] Server error: ${serverError}`)
+      return { 
+        success: false, 
+        message: serverError, 
+        error: serverError 
+      }
+    }
+    
     return { success: false, message: errMsg, error: errMsg }
   }
 }
 
-// Retrieve analytics data from SQLite database
+// Retrieve analytics data from database via backend API
 async function getAnalyticsDataFromDB(projectToken: string): Promise<any> {
   try {
-    console.log(`[DB RETRIEVE] Looking for cached data for ${projectToken}...`)
+    console.log(`[DB RETRIEVE] Looking for cached data for ${projectToken} via backend API...`)
 
-    const projectRoot = path.resolve(process.cwd(), '..')
-    const backendDir = path.join(projectRoot, 'backend')
-    const pythonExe = path.join(projectRoot, '.venv', 'Scripts', 'python.exe')
+    // Import getApiBaseUrl
+    const { getApiBaseUrl, getApiHeaders } = await import('@/lib/apiBase')
+    const backendUrl = getApiBaseUrl()
 
-    if (!fs.existsSync(pythonExe)) {
-      console.log(`[DB RETRIEVE] Python exe not found`)
-      return null
-    }
-
-    if (!fs.existsSync(backendDir)) {
-      console.log(`[DB RETRIEVE] Backend dir not found`)
-      return null
-    }
-
-    const pythonScript = `
-import sys
-import json
-sys.path.insert(0, '.')
-from database import ParseHubDatabase
-
-def main():
-    try:
-        # Get project token from command line argument
-        if len(sys.argv) < 2:
-            raise ValueError("No project token provided")
-        
-        project_token = sys.argv[1]
-        print(f"[PYTHON] Getting analytics data for {project_token}...", file=sys.stderr)
-        
-        db = ParseHubDatabase()
-        try:
-            result = db.get_analytics_data(project_token)
-            
-            if result:
-                records_count = len(result.get('raw_data', []))
-                print(f"[PYTHON] Found data with {records_count} records", file=sys.stderr)
-                # Convert datetime objects to strings for JSON serialization
-                import datetime
-                def default_handler(obj):
-                    if isinstance(obj, datetime.datetime):
-                        return obj.isoformat()
-                    return str(obj)
-                print(json.dumps(result, default=default_handler))
-            else:
-                print(f"[PYTHON] No data found in database for {project_token}", file=sys.stderr)
-                print(json.dumps({"found": False}))
-        finally:
-            db.disconnect()
-    
-    except Exception as e:
-        import traceback
-        error_msg = str(e)
-        print(f"[PYTHON] ERROR: {error_msg}", file=sys.stderr)
-        print(traceback.format_exc(), file=sys.stderr)
-        print(json.dumps({"found": False, "error": error_msg}))
-        sys.exit(1)
-
-if __name__ == '__main__':
-    main()
-`
-
-    const output = execSync(
-      `"${pythonExe}" -c "${pythonScript.replace(/"/g, '\\"')}" "${projectToken}"`,
+    const response = await axios.get(
+      `${backendUrl}/api/get-analytics`,
       {
-        cwd: backendDir,
-        encoding: 'utf-8',
-        maxBuffer: 100 * 1024 * 1024,
-        stdio: ['pipe', 'pipe', 'pipe'],
-        timeout: 30000,
+        params: { project_token: projectToken },
+        headers: getApiHeaders(),
+        timeout: 15000,
       }
     )
 
-    if (!output || output.trim().length === 0) {
-      console.log(`[DB RETRIEVE] No output from Python script`)
+    const result = response.data
+
+    if (!result.success) {
+      console.error(`❌ [DB RETRIEVE] API error: ${result.error}`)
       return null
     }
 
-    let result
-    try {
-      result = JSON.parse(output)
-    } catch (e) {
-      console.error(`[DB RETRIEVE] Failed to parse output as JSON: ${output}`)
-      return null
-    }
-
-    if (result.found === false) {
+    if (!result.found) {
       console.log(`[DB RETRIEVE] No cached data found for ${projectToken}`)
       return null
     }
 
-    const recordCount = result.raw_data ? result.raw_data.length : 0
+    const recordCount = result.data?.raw_data ? result.data.raw_data.length : 0
     console.log(`✅ [DB RETRIEVE] Retrieved cached data: ${recordCount} records for ${projectToken}`)
-    return result
+    return result.data
+
   } catch (error) {
-    console.error(`❌ [DB RETRIEVE] Error retrieving analytics from DB:`, error instanceof Error ? error.message : error)
+    const errMsg = error instanceof Error ? error.message : String(error)
+    console.error(`❌ [DB RETRIEVE] Error retrieving analytics from DB:`, errMsg)
+    
+    if (axios.isAxiosError(error)) {
+      const serverError = error.response?.data?.error || error.message
+      console.error(`❌ [DB RETRIEVE] Server error: ${serverError}`)
+    }
+    
     return null
   }
 }
@@ -556,144 +346,6 @@ async function fetchAndStoreProjectData(projectToken: string) {
   }
 }
 
-// Get analytics by executing Python script (DEPRECATED - using database instead)
-// async function getAnalytics(token: string) {
-/*
-async function getAnalytics(token: string) {
-  try {
-    // Execute Python analytics script to get database info
-    // process.cwd() is frontend directory, go up one level to reach project root
-    const projectRoot = path.resolve(process.cwd(), '..')
-    const backendDir = path.join(projectRoot, 'backend')
-    const pythonScriptPath = path.join(backendDir, 'analytics.py')
-    
-    console.log('Project root:', projectRoot)
-    console.log('Backend dir:', backendDir)
-    console.log('Looking for analytics script at:', pythonScriptPath)
-    
-    if (fs.existsSync(pythonScriptPath)) {
-      try {
-        const pythonExe = path.join(projectRoot, '.venv', 'Scripts', 'python.exe')
-        console.log('Python executable at:', pythonExe)
-        
-        if (fs.existsSync(pythonExe)) {
-          const output = execSync(
-            `"${pythonExe}" "${pythonScriptPath}" "${token}"`,
-            { 
-              cwd: backendDir,
-              encoding: 'utf-8',
-              maxBuffer: 10 * 1024 * 1024,
-              stdio: ['pipe', 'pipe', 'pipe']
-            }
-          )
-          
-          console.log('Analytics output received, length:', output.length)
-          
-          // Parse JSON output
-          try {
-            const data = JSON.parse(output.trim())
-            console.log('Parsed data structure:', Object.keys(data), 'has overview:', !!data.overview)
-            
-            // Check if this is already in the correct format (has overview/performance structure)
-            if (data && data.overview && data.performance) {
-              // Data is already in correct format, just return it
-              console.log('Data already in correct format')
-              return data
-            }
-            
-            if (data && !data.error) {
-              // Map the analytics data to the component's expected format
-              console.log('Parsed analytics data successfully')
-              const analyticsData = {
-                overview: {
-                  total_runs: data.overview?.total_runs || data.total_runs || 0,
-                  completed_runs: data.overview?.completed_runs || data.completed_runs || 0,
-                  total_records_scraped: data.overview?.total_records_scraped || data.total_records || 0,
-                  progress_percentage: data.overview?.progress_percentage || data.progress_percentage || 0,
-                },
-                performance: {
-                  items_per_minute: data.performance?.items_per_minute || data.items_per_minute || 0,
-                  estimated_total_items: data.performance?.estimated_total_items || data.estimated_total_items || 0,
-                  average_run_duration_seconds: data.performance?.average_run_duration_seconds || data.avg_duration || 0,
-                  current_items_count: data.performance?.current_items_count || data.total_records || 0,
-                },
-                recovery: {
-                  in_recovery: data.recovery?.in_recovery || false,
-                  status: data.recovery?.status || 'normal',
-                  total_recovery_attempts: data.recovery?.total_recovery_attempts || 0,
-                },
-                data_quality: {
-                  average_completion_percentage: data.data_quality?.average_completion_percentage || 100,
-                  total_fields: data.data_quality?.total_fields || 0,
-                },
-                timeline: data.timeline || [],
-              }
-              return analyticsData
-            }
-          } catch (parseError) {
-            console.error('JSON parse error:', parseError)
-            console.error('Output was:', output.substring(0, 500))
-          }
-        }
-      } catch (execError) {
-        console.error('Python script execution error:', execError)
-        if (execError instanceof Error) {
-          console.error('Error message:', execError.message)
-        }
-      }
-    } else {
-      console.log('Analytics script not found at:', pythonScriptPath)
-    }
-    
-    // Fallback to monitoring results JSON
-    const monitPath = path.join(projectRoot, 'monitoring_results.json')
-    
-    if (fs.existsSync(monitPath)) {
-      console.log('Using fallback monitoring_results.json')
-      const content = fs.readFileSync(monitPath, 'utf-8')
-      const results = JSON.parse(content)
-
-      if (results.project_data) {
-        const projectData = results.project_data.find(
-          (p: any) => p.token === token
-        )
-
-        if (projectData) {
-          return {
-            overview: {
-              total_runs: 1,
-              completed_runs: projectData.status === 'complete' ? 1 : 0,
-              total_records_scraped: projectData.records || 0,
-              progress_percentage: projectData.status === 'complete' ? 100 : 50,
-            },
-            performance: {
-              items_per_minute: projectData.items_per_minute || 0,
-              estimated_total_items: projectData.records || 0,
-              average_run_duration_seconds: 0,
-              current_items_count: projectData.records || 0,
-            },
-            recovery: {
-              in_recovery: false,
-              status: 'normal',
-              total_recovery_attempts: 0,
-            },
-            data_quality: {
-              average_completion_percentage: 100,
-              total_fields: 0,
-            },
-            timeline: [],
-          }
-        }
-      }
-    }
-
-    return null
-  } catch (error) {
-    console.error('Error getting analytics:', error)
-    return null
-  }
-}
-*/
 
 export async function GET(request: NextRequest) {
   try {

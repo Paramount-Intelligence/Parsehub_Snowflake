@@ -1,5 +1,5 @@
 "use client";
-import React, { useState } from "react";
+import { useState } from "react";
 import { X, Plus, Minus } from "lucide-react";
 
 interface BatchConfig {

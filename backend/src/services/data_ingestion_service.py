@@ -199,19 +199,23 @@ class ParseHubDataIngestor:
 
         return products
 
-    def ingest_run(self, project_id: int, project_token: str, run_token: str) -> dict:
+    def ingest_run(self, project_id: int, project_token: str, run_token: str, 
+                   source_page: int = None) -> dict:
         """
         Ingest data from a specific ParseHub run into the database
-
+        
         Args:
             project_id: Database project ID
             project_token: ParseHub project token
             run_token: ParseHub run token
+            source_page: Optional source page number for batch-based scraping deduplication
 
         Returns:
             Status dictionary with insertion results
         """
         print(f"\n[INGEST] Starting data ingestion for run {run_token}")
+        if source_page:
+            print(f"[INGEST] Source page: {source_page}")
 
         # Get run status
         run_data = self.get_run_data(run_token)
@@ -283,6 +287,9 @@ class ParseHubDataIngestor:
         for product in products:
             if isinstance(product, dict):
                 product['run_token'] = run_token
+                # Add source_page if provided (for batch deduplication)
+                if source_page:
+                    product['source_page'] = source_page
                 # Preserve page number if it exists
                 if 'page_number' not in product and 'page' in product:
                     product['page_number'] = product['page']

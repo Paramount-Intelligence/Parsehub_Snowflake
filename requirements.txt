@@ -1,10 +1,10 @@
-# Core Web Framework (Python 3.14 pre-built only)
+# Core Web Framework (Python 3.12+ recommended for Snowflake wheels)
 flask==3.0.0
 flask-cors==4.0.0
 gunicorn==21.2.0
 
-# HTTP & API
-requests==2.31.0
+# HTTP & API (>=2.32.4 required by snowflake-connector-python)
+requests>=2.32.4,<3
 
 # Environment & Configuration
 python-dotenv==1.0.0
@@ -17,16 +17,7 @@ werkzeug==3.0.0
 packaging==23.2
 typing-extensions==4.8.0
 
-# Note: For Python 3.14, some packages with C extensions are not yet available
-# Snowflake connectivity will use environment variables directly
-# For production: Use Python 3.12 to get full Snowflake support
-
-# IF YOU WANT FULL SNOWFLAKE SUPPORT:
-# 1. Switch to Python 3.12 (recommended)
-# 2. Or install Visual C++ Build Tools
-# 3. Then you can add:
-#    - snowflake-connector-python==3.10.1
-#    - snowflake-sqlalchemy==1.5.1
-#    - sqlalchemy==2.0.36
-#    - cryptography==41.0.7
-#    - PyJWT==2.11.0
+# Snowflake (backend venv: py -3.12 -m venv backend/venv312)
+snowflake-connector-python>=3.10.1
+snowflake-sqlalchemy>=1.5.1
+sqlalchemy>=2.0.36

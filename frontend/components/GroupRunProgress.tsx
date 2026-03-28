@@ -1,5 +1,5 @@
 "use client";
-import React, { useState } from "react";
+import { useState } from "react";
 import { X, CheckCircle2, AlertCircle, ChevronDown, Copy } from "lucide-react";
 
 interface BatchResult {
@@ -27,7 +27,6 @@ interface GroupRunProgressProps {
 }
 
 export default function GroupRunProgress({
-  groupRunId,
   brand,
   isOpen,
   onClose,

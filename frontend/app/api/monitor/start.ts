@@ -5,12 +5,17 @@ export async function POST(request: NextRequest) {
   try {
     const { projectToken, runToken, pages } = await request.json();
 
-    if (!projectToken || !runToken || !pages) {
+    if (!projectToken || !runToken) {
       return NextResponse.json(
-        { error: 'Missing required fields: projectToken, runToken, pages' },
+        { error: 'Missing required fields: projectToken, runToken' },
         { status: 400 }
       );
     }
+
+    // Allow 0 (unknown / not yet loaded total_pages)
+    const raw = pages ?? 0;
+    const n = typeof raw === 'number' ? raw : Number(raw);
+    const pageCount = Number.isFinite(n) ? n : 0;
 
     // Call Python backend API to start monitoring
     const backendUrl = getApiBaseUrl();
@@ -23,11 +28,11 @@ export async function POST(request: NextRequest) {
       },
       body: JSON.stringify({
         run_token: runToken,
-        pages: pages,
+        pages: pageCount,
       }),
     });
 
-    if (!response.status === 200) {
+    if (response.status !== 200) {
       const error = await response.text();
       console.error('Backend error:', error);
       return NextResponse.json(

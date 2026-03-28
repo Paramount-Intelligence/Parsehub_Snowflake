@@ -4,16 +4,24 @@ Advanced Analytics Service - Comprehensive data analysis and statistics
 
 import json
 import csv
+import sys
 from io import StringIO
 from datetime import datetime
 from typing import Dict, List, Optional
+from pathlib import Path
+
+root_dir = Path(__file__).parent.parent.parent  # backend/
+if str(root_dir) not in sys.path:
+    sys.path.insert(0, str(root_dir))
+
+from src.models.database import ParseHubDatabase
 
 
 class AdvancedAnalyticsService:
     """Service for comprehensive analytics and statistics"""
     
-    def __init__(self, db_path: str = "parsehub.db"):
-        self.db_path = db_path
+    def __init__(self):
+        self.db = ParseHubDatabase()
     
     def get_project_analytics(self, project_id: int) -> Optional[Dict]:
         """
@@ -28,55 +36,85 @@ class AdvancedAnalyticsService:
                 'pagination_status': {...}
             }
         """
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
+        try:
+            conn = self.db.connect()
+            if not conn:
+                return None
+            cursor = conn.cursor()
+            
+            # Get project info
+            cursor.execute('''
+                SELECT id, token, title FROM projects WHERE id = %s
+            ''', (project_id,))
+            project = cursor.fetchone()
+            
+            if not project:
+                self.db.disconnect()
+                return None
         
-        # Get project info
-        cursor.execute('''
-            SELECT id, token, title FROM projects WHERE id = %s
-        ''', (project_id,))
-        project = cursor.fetchone()
+            # Get data stats
+            cursor.execute('''
+                SELECT COUNT(*) as total FROM scraped_data WHERE project_id = %s
+            ''', (project_id,))
+            result = cursor.fetchone()
+            # Handle both dict and tuple results
+            total_records = (result.get('total') if isinstance(result, dict) else result[0]) if result else 0
         
-        if not project:
-            conn.close()
+            # Get runs info
+            cursor.execute('''
+                SELECT 
+                    COUNT(*) as total_runs,
+                    SUM(CASE WHEN status='complete' THEN 1 ELSE 0 END) as completed_runs,
+                    MAX(end_time) as last_completed
+                FROM runs WHERE project_id = %s
+            ''', (project_id,))
+            runs_info = cursor.fetchone()
+            
+            # Calculate statistics
+            stats = self.calculate_statistics(project_id)
+            
+            # Get pagination info
+            cursor.execute('''
+                SELECT 
+                    MAX(CAST(json_extract(data, '$.page_number') AS INTEGER)) as last_page
+                FROM scraped_data WHERE project_id = %s
+            ''', (project_id,))
+            page_result = cursor.fetchone()
+            last_page = (page_result.get('last_page') if isinstance(page_result, dict) else page_result[0]) if page_result else 1
+            
+            self.db.disconnect()
+        except Exception as e:
+            print(f"[ERROR] get_project_analytics failed: {e}", file=sys.stderr)
             return None
         
-        # Get data stats
-        cursor.execute('''
-            SELECT COUNT(*) as total FROM scraped_data WHERE project_id = %s
-        ''', (project_id,))
-        total_records = cursor.fetchone()['total'] or 0
         
-        # Get runs info
-        cursor.execute('''
-            SELECT 
-                COUNT(*) as total_runs,
-                SUM(CASE WHEN status='complete' THEN 1 ELSE 0 END) as completed_runs,
-                MAX(end_time) as last_completed
-            FROM runs WHERE project_id = %s
-        ''', (project_id,))
-        runs_info = cursor.fetchone()
+        # Extract values from project row
+        if isinstance(project, dict):
+            project_data = {k.lower(): v for k, v in project.items()}
+            proj_id = project_data.get('id')
+            proj_token = project_data.get('token')
+            proj_title = project_data.get('title')
+        else:
+            proj_id = project[0]
+            proj_token = project[1]
+            proj_title = project[2]
         
-        # Calculate statistics
-        stats = self.calculate_statistics(project_id)
-        
-        # Get pagination info
-        cursor.execute('''
-            SELECT 
-                MAX(CAST(json_extract(data, '$.page_number') AS INTEGER)) as last_page
-            FROM scraped_data WHERE project_id = %s
-        ''', (project_id,))
-        page_result = cursor.fetchone()
-        last_page = page_result['last_page'] or 1 if page_result else 1
-        
-        conn.close()
+        # Extract values from runs_info row
+        if isinstance(runs_info, dict):
+            runs_lower = {k.lower(): v for k, v in runs_info.items()}
+            total_runs = runs_lower.get('total_runs') or 0
+            completed_runs = runs_lower.get('completed_runs') or 0
+            last_completed = runs_lower.get('last_completed')
+        else:
+            total_runs = runs_info[0] or 0
+            completed_runs = runs_info[1] or 0
+            last_completed = runs_info[2]
         
         analytics = {
             'project': {
-                'id': project['id'],
-                'token': project['token'],
-                'title': project['title']
+                'id': proj_id,
+                'token': proj_token,
+                'title': proj_title
             },
             'data': {
                 'total_records': total_records,
@@ -84,9 +122,9 @@ class AdvancedAnalyticsService:
                 'completion_score': self._calculate_completion_score(stats)
             },
             'runs': {
-                'total_runs': runs_info['total_runs'] or 0,
-                'completed_runs': runs_info['completed_runs'] or 0,
-                'last_completed': runs_info['last_completed']
+                'total_runs': total_runs,
+                'completed_runs': completed_runs,
+                'last_completed': last_completed
             },
             'data_quality': stats,
             'timestamp': datetime.now().isoformat()
@@ -110,14 +148,16 @@ class AdvancedAnalyticsService:
                 }
             }
         """
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
+        try:
+            conn = self.db.connect()
+            if not conn:
+                return {}
+            cursor = conn.cursor()
         
-        # Get all data for this project
-        cursor.execute('''
-            SELECT data FROM scraped_data WHERE project_id = %s
-            ORDER BY created_at ASC
+            # Get all data for this project
+            cursor.execute('''
+                SELECT data FROM scraped_data WHERE project_id = %s
+                ORDER BY created_at ASC
         ''', (project_id,))
         
         raw_data = cursor.fetchall()
@@ -204,17 +244,22 @@ class AdvancedAnalyticsService:
         """
         Get all values for a specific column
         """
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT data FROM scraped_data WHERE project_id = %s
-            LIMIT %s
-        ''', (project_id, limit))
-        
-        rows = cursor.fetchall()
-        conn.close()
+        try:
+            conn = self.db.connect()
+            if not conn:
+                return []
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT data FROM scraped_data WHERE project_id = %s
+                LIMIT %s
+            ''', (project_id, limit))
+            
+            rows = cursor.fetchall()
+            self.db.disconnect()
+        except Exception as e:
+            print(f"[ERROR] get_data_by_column failed: {e}", file=sys.stderr)
+            return []
         
         values = []
         for row in rows:
@@ -229,17 +274,22 @@ class AdvancedAnalyticsService:
     
     def export_data_csv(self, project_id: int) -> str:
         """Export project data as CSV"""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT data FROM scraped_data WHERE project_id = %s
-            ORDER BY created_at ASC
-        ''', (project_id,))
-        
-        rows = cursor.fetchall()
-        conn.close()
+        try:
+            conn = self.db.connect()
+            if not conn:
+                return ""
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT data FROM scraped_data WHERE project_id = %s
+                ORDER BY created_at ASC
+            ''', (project_id,))
+            
+            rows = cursor.fetchall()
+            self.db.disconnect()
+        except Exception as e:
+            print(f"[ERROR] export_data_csv failed: {e}", file=sys.stderr)
+            return ""
         
         if not rows:
             return ""
@@ -271,17 +321,22 @@ class AdvancedAnalyticsService:
     
     def export_data_json(self, project_id: int) -> str:
         """Export project data as JSON"""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT data FROM scraped_data WHERE project_id = %s
-            ORDER BY created_at ASC
-        ''', (project_id,))
-        
-        rows = cursor.fetchall()
-        conn.close()
+        try:
+            conn = self.db.connect()
+            if not conn:
+                return ""
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT data FROM scraped_data WHERE project_id = %s
+                ORDER BY created_at ASC
+            ''', (project_id,))
+            
+            rows = cursor.fetchall()
+            self.db.disconnect()
+        except Exception as e:
+            print(f"[ERROR] export_data_json failed: {e}", file=sys.stderr)
+            return ""
         
         data_list = []
         for row in rows:

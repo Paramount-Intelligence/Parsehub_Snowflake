@@ -29,10 +29,17 @@ export default function ScheduledRunsModal({ isOpen, onClose }: ScheduledRunsMod
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Fetch scheduled runs on modal open and poll every 3 seconds
   useEffect(() => {
-    if (isOpen) {
-      fetchScheduledRuns();
-    }
+    if (!isOpen) return;
+
+    // Fetch immediately when modal opens
+    fetchScheduledRuns();
+
+    // Set up polling every 3 seconds to detect newly scheduled runs
+    const interval = setInterval(fetchScheduledRuns, 3000);
+
+    return () => clearInterval(interval);
   }, [isOpen]);
 
   const fetchScheduledRuns = async () => {
@@ -64,10 +71,6 @@ export default function ScheduledRunsModal({ isOpen, onClose }: ScheduledRunsMod
       console.error('Error cancelling run:', err);
       alert('Failed to cancel scheduled run');
     }
-  };
-
-  const getJobId = (run: ScheduledRun) => {
-    return run.job_id;
   };
 
   const formatScheduleInfo = (run: ScheduledRun) => {
@@ -123,6 +126,11 @@ export default function ScheduledRunsModal({ isOpen, onClose }: ScheduledRunsMod
                         <span className="px-2 py-0.5 bg-purple-600/50 text-purple-200 text-xs rounded-full flex-shrink-0">
                           {run.type === 'once' ? 'Once' : 'Recurring'}
                         </span>
+                        {run.pages > 1 && (
+                          <span className="px-2 py-0.5 bg-blue-600/50 text-blue-200 text-xs rounded-full flex-shrink-0">
+                            {run.pages} pages
+                          </span>
+                        )}
                       </div>
 
                       <p className="text-slate-300 text-sm mb-2">

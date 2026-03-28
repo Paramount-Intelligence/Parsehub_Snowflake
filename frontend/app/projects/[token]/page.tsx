@@ -133,6 +133,13 @@ export default function ProjectDetailsPage() {
   const [project, setProject] = useState<ProjectData | null>(null);
   const [metadata, setMetadata] = useState<Metadata | null>(null);
   const [productStats, setProductStats] = useState<ProductStats | null>(null);
+  const [ingestedStats, setIngestedStats] = useState<{
+    total_runs: number;
+    total_products: number;
+    pages_scraped: number;
+    last_extraction: string | null;
+    recent_runs: Array<{run_token: string; run_time: string}>;
+  } | null>(null);
   const [analytics, setAnalytics] = useState<Analytics | null>(null);
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
@@ -252,6 +259,44 @@ export default function ProjectDetailsPage() {
         } catch (err) {
           console.log("Product stats not available for this project");
         }
+      }
+
+      // Fetch ingested stats from scraped_records
+      try {
+        const ingestedStatsResponse = await fetch(
+          `/api/projects/${token}/ingested-stats`,
+          { headers: getApiHeaders() },
+        );
+
+        if (ingestedStatsResponse.ok) {
+          const ingestedData = await ingestedStatsResponse.json();
+          if (ingestedData.success) {
+            setIngestedStats({
+              total_runs: ingestedData.total_runs || 0,
+              total_products: ingestedData.total_products || 0,
+              pages_scraped: ingestedData.pages_scraped || 0,
+              last_extraction: ingestedData.last_extraction,
+              recent_runs: ingestedData.recent_runs || [],
+            });
+
+            // Also merge with product stats if we have data
+            if (ingestedData.total_products > 0) {
+              setProductStats((prevStats: ProductStats | null) => ({
+                ...prevStats,
+                statistics: {
+                  total_products: ingestedData.total_products,
+                  total_runs_with_data: ingestedData.total_runs,
+                  latest_extraction: ingestedData.last_extraction,
+                  // Preserve other stats if they exist
+                  top_countries: prevStats?.statistics?.top_countries || [],
+                  top_brands: prevStats?.statistics?.top_brands || [],
+                },
+              }));
+            }
+          }
+        }
+      } catch (err) {
+        console.log("Ingested stats not available for this project");
       }
 
       // Fetch analytics
@@ -1277,7 +1322,7 @@ export default function ProjectDetailsPage() {
               </div>
             )}
 
-            {/* Quick Stats */}
+            {/* Quick Stats - Use ingested stats if available, fallback to run_stats */}
             <div className="bg-gradient-to-br from-blue-500/10 to-blue-500/5 border border-blue-500/30 rounded-xl p-5">
               <h3 className="text-sm font-semibold text-blue-400 mb-4 flex items-center gap-2">
                 <BarChart3 className="w-4 h-4" />
@@ -1288,23 +1333,19 @@ export default function ProjectDetailsPage() {
                 <div>
                   <p className="text-xs text-slate-400 mb-1">Total Runs</p>
                   <p className="text-2xl font-bold text-white">
-                    {project.run_stats?.total_runs || 0}
+                    {ingestedStats?.total_runs ?? project.run_stats?.total_runs ?? 0}
                   </p>
                 </div>
                 <div>
                   <p className="text-xs text-slate-400 mb-1">Pages Scraped</p>
                   <p className="text-2xl font-bold text-emerald-400">
-                    {project.run_stats?.pages_scraped || 0}
+                    {ingestedStats?.pages_scraped ?? project.run_stats?.pages_scraped ?? 0}
                   </p>
                 </div>
                 <div>
-                  <p className="text-xs text-slate-400 mb-1">Success Rate</p>
-                  <p className="text-2xl font-bold text-amber-400">
-                    {project.run_stats && project.run_stats.total_runs > 0
-                      ? `${project.run_stats.success_rate}%`
-                      : project.run_stats?.total_runs === 0
-                        ? "No runs yet"
-                        : "—"}
+                  <p className="text-xs text-slate-400 mb-1">Records Stored</p>
+                  <p className="text-2xl font-bold text-purple-400">
+                    {ingestedStats?.total_products ?? 0}
                   </p>
                 </div>
               </div>

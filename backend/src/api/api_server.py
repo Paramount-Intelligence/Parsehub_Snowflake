@@ -37,6 +37,8 @@ from src.api.fetch_projects import fetch_all_projects, get_all_projects_with_cac
 from src.services.incremental_scraping_scheduler import start_incremental_scraping_scheduler, stop_incremental_scraping_scheduler
 from src.services.auto_sync_service import start_auto_sync_service, stop_auto_sync_service, get_auto_sync_service
 from src.services.scheduled_run_service import start_scheduled_run_service, stop_scheduled_run_service, get_scheduled_run_service
+from src.services.auto_complete_service import AutoCompleteService, start_auto_complete_service, register_run_for_completion
+from src.api.resume_routes import resume_bp
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -46,6 +48,9 @@ app = Flask(__name__)
 _origins = os.getenv('ALLOWED_ORIGINS', '*')
 _cors_origins = [o.strip() for o in _origins.split(',') if o.strip()] if _origins != '*' else '*'
 CORS(app, resources={r"/api/*": {"origins": _cors_origins}, r"/health": {"origins": _cors_origins}}, supports_credentials=False)
+
+# Register blueprints
+app.register_blueprint(resume_bp)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -60,6 +65,7 @@ _analytics_service = None
 _excel_import_service = None
 _auto_runner_service = None
 _group_run_service = None
+_auto_complete_service = None
 _services_initialized = False
 _services_lock = __import__('threading').Lock()
 
@@ -84,7 +90,7 @@ def _initialize_services():
     pool_pre_ping will recover connections automatically when PG is healthy.
     """
     global _db, _monitoring_service, _analytics_service
-    global _excel_import_service, _auto_runner_service, _group_run_service, _services_initialized
+    global _excel_import_service, _auto_runner_service, _group_run_service, _auto_complete_service, _services_initialized
 
     with _services_lock:
         if _services_initialized:
@@ -114,6 +120,13 @@ def _initialize_services():
             _excel_import_service = ExcelImportService(_db)
             _auto_runner_service  = AutoRunnerService()
             _group_run_service    = GroupRunService(_db)
+            _auto_complete_service = AutoCompleteService()
+
+            # Link scraper to auto-complete service for resume capability
+            from src.services.metadata_driven_resume_scraper import get_metadata_driven_scraper
+            _scraper = get_metadata_driven_scraper()
+            _auto_complete_service.set_scraper(_scraper)
+            logger.info('[boot] Auto-complete service initialized with scraper linked')
         except Exception as exc:
             logger.error(f'[boot] Service setup failed: {exc}')
 
@@ -177,15 +190,39 @@ def ensure_services():
 
 @app.teardown_appcontext
 def return_db_connection(exc=None):
-    """Return the PostgreSQL connection to the pool after every request.
+    """Return the database connection after every request.
+    Works for PostgreSQL, Snowflake, and SQLite.
     Fully guarded — must never raise under any circumstances.
     """
     try:
-        conn = g.get('db') or _db
-        if conn is not None and getattr(conn, 'use_postgres', False):
-            conn.disconnect()   # returns raw_connection to SQLAlchemy pool
+        db = g.get('db') or _db
+        if db is not None:
+            # Disconnect for any database type (PostgreSQL, Snowflake, SQLite)
+            db.disconnect()
     except Exception as e:
         logger.warning(f'[teardown] Error returning DB connection: {e}')
+
+
+# Cache for frequently accessed data
+_filter_cache = {}
+_filter_cache_timestamp = None
+FILTER_CACHE_TTL_SECONDS = 300  # 5 minutes
+
+def get_cached_filters(db):
+    """Get filter options with caching to avoid repeated Snowflake queries."""
+    global _filter_cache, _filter_cache_timestamp
+    import time
+
+    now = time.time()
+    if _filter_cache_timestamp and (now - _filter_cache_timestamp) < FILTER_CACHE_TTL_SECONDS:
+        logger.debug('[CACHE] Returning cached filter options')
+        return _filter_cache
+
+    # Cache miss - fetch from database
+    logger.info('[CACHE] Fetching fresh filter options from Snowflake')
+    _filter_cache = db.get_filters_schema_aware()
+    _filter_cache_timestamp = now
+    return _filter_cache
 
 # ── Health (single definition each — no Blueprint, no duplicate endpoint) ─────────
 @app.route('/health', methods=['GET'], endpoint='health_root')
@@ -239,6 +276,7 @@ def health_check_db():
 
 def _start_background_services():
     """Start background scheduler services (called inside _initialize_services)."""
+    global _auto_complete_service
     try:
         check_interval = int(os.getenv('INCREMENTAL_SCRAPING_INTERVAL', '30'))
         sync_interval  = int(os.getenv('AUTO_SYNC_INTERVAL', '5'))
@@ -248,13 +286,25 @@ def _start_background_services():
         if get_auto_sync_service() is None:
             start_incremental_scraping_scheduler(check_interval)
             start_auto_sync_service(sync_interval)
-            
+
             # Start scheduled run service with database
             scheduled_service = start_scheduled_run_service()
             if _db is not None:
                 scheduled_service.set_database(_db)
                 logger.info('[bg] Scheduled run service linked to database')
-            
+
+            # Start auto-complete service with database and scraper linked
+            try:
+                _auto_complete_service = start_auto_complete_service()
+                if _db is not None:
+                    _auto_complete_service.set_database(_db)
+                    from src.services.metadata_driven_resume_scraper import get_metadata_driven_scraper
+                    _scraper = get_metadata_driven_scraper()
+                    _auto_complete_service.set_scraper(_scraper)
+                    logger.info('[bg] Auto-complete service started with DB and scraper linked')
+            except Exception as ace:
+                logger.error(f'[bg] Auto-complete service failed to start: {ace}')
+
             logger.info('[bg] Background services started.')
     except Exception as exc:
         logger.error(f'[bg] Failed to start background services: {exc}')
@@ -300,7 +350,23 @@ def start_monitoring():
         if not run_token:
             return jsonify({'error': 'Missing required field: run_token'}), 400
 
-        # If project_id not provided, infer from run token in active runs
+        # If project_id not provided, infer from run token
+        if not project_id:
+            # First try: look up in database runs table
+            try:
+                cursor = g.db.cursor()
+                cursor.execute(
+                    'SELECT project_id FROM runs WHERE run_token = %s ORDER BY created_at DESC LIMIT 1',
+                    (run_token,)
+                )
+                result = cursor.fetchone()
+                if result:
+                    project_id = result['project_id'] if isinstance(result, dict) else result[0]
+                    logger.info(f'[MONITOR] Found project_id={project_id} from database for run_token={run_token[:8]}...')
+            except Exception as db_err:
+                logger.warning(f'[MONITOR] Could not look up project_id from DB: {db_err}')
+
+        # Second try: look in active_runs.json file
         if not project_id:
             try:
                 with open('../active_runs.json', 'r') as f:
@@ -314,6 +380,7 @@ def start_monitoring():
                 pass
 
         if not project_id:
+            logger.error(f'[MONITOR] Could not determine project_id for run_token={run_token[:8]}...')
             return jsonify({'error': 'Could not determine project_id'}), 400
 
         # Create monitoring session in database
@@ -1161,6 +1228,90 @@ def get_projects_bulk():
         return jsonify({'error': 'Failed to fetch projects'}), 500
 
 
+@app.route('/api/projects/<project_token>/resume/checkpoint', methods=['GET'])
+def get_project_checkpoint(project_token: str):
+    """
+    Get checkpoint (highest_successful_page) for a project
+    Used by frontend to determine scraping progress
+    """
+    try:
+        logger.info(f'[API] Fetching checkpoint for project: {project_token}')
+
+        # Get project ID from token
+        cursor = g.db.cursor()
+        cursor.execute('SELECT id FROM projects WHERE token = %s', (project_token,))
+        row = cursor.fetchone()
+
+        if not row:
+            return jsonify({'error': 'Project not found'}), 404
+
+        project_id = row.get('id') if isinstance(row, dict) else row[0]
+
+        # Get checkpoint from metadata-driven scraper
+        from src.services.metadata_driven_resume_scraper import get_metadata_driven_scraper
+        scraper = get_metadata_driven_scraper()
+        checkpoint = scraper.get_checkpoint(project_id)
+
+        logger.info(f'[API] Checkpoint for {project_token}: {checkpoint}')
+        return jsonify({
+            'success': True,
+            'project_token': project_token,
+            'checkpoint': checkpoint
+        }), 200
+
+    except Exception as e:
+        logger.error(f'[API] Error fetching checkpoint for {project_token}: {e}')
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'checkpoint': {
+                'highest_successful_page': 0,
+                'next_start_page': 1,
+                'total_persisted_records': 0,
+                'checkpoint_timestamp': datetime.now().isoformat()
+            }
+        }), 500
+
+
+@app.route('/api/projects/<project_token>/resume/metadata', methods=['GET'])
+def get_project_resume_metadata(project_token: str):
+    """
+    Get metadata for resume scraping (total_pages, base_url, etc.)
+    """
+    try:
+        logger.info(f'[API] Fetching resume metadata for project: {project_token}')
+
+        # Get project metadata
+        metadata = g.db.get_metadata_by_project_token(project_token)
+
+        if not metadata:
+            return jsonify({
+                'success': False,
+                'error': 'Metadata not found for project'
+            }), 404
+
+        return jsonify({
+            'success': True,
+            'project_token': project_token,
+            'metadata': {
+                'total_pages': metadata.get('total_pages', 0),
+                'total_products': metadata.get('total_products', 0),
+                'current_page_scraped': metadata.get('current_page_scraped', 0),
+                'website_url': metadata.get('website_url', ''),
+                'region': metadata.get('region', ''),
+                'country': metadata.get('country', ''),
+                'brand': metadata.get('brand', '')
+            }
+        }), 200
+
+    except Exception as e:
+        logger.error(f'[API] Error fetching resume metadata for {project_token}: {e}')
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
 @app.route('/api/projects/sync', methods=['POST'])
 def sync_projects():
     """
@@ -1168,7 +1319,10 @@ def sync_projects():
     Fetches all projects and stores them in the database
     """
     try:
-        api_key = request.json.get('api_key') if request.json else None
+        # Handle both JSON and form data
+        api_key = None
+        if request.is_json:
+            api_key = request.json.get('api_key') if request.json else None
         api_key = api_key or os.getenv('PARSEHUB_API_KEY')
 
         if not api_key:
@@ -1281,14 +1435,14 @@ def get_filters():
     """
     Get all available filter options (schema-aware from metadata table).
     Returns regions, countries, brands, and websites; uses actual column names from DB.
+    Cached for 5 minutes to reduce Snowflake queries.
     """
     # Public read endpoint - no authentication required
     try:
-        logger.info('[API] Getting filter options (schema-aware)...')
-        filters = g.db.get_filters_schema_aware()
+        logger.info('[API] Getting filter options (with caching)...')
+        filters = get_cached_filters(g.db)
         logger.info(
             f'[API] Filters - Regions: {len(filters["regions"])}, Countries: {len(filters["countries"])}, Brands: {len(filters["brands"])}, Websites: {len(filters["websites"])}')
-        logger.info(f'[API] Full filters object: {filters}')
         return jsonify({
             'success': True,
             'filters': filters
@@ -1377,6 +1531,148 @@ def get_project_by_id(project_id: int):
         return jsonify({'success': True, 'data': project}), 200
     except Exception as e:
         logger.error(f'[API] Error getting project by id {project_id}: {e}')
+        return jsonify({'error': str(e), 'success': False}), 500
+
+
+@app.route('/api/projects/<project_token>/ingested-stats', methods=['GET'])
+def get_project_ingested_stats(project_token: str):
+    """
+    Get ingested statistics for a project. Primary source is Snowflake scraped_data
+    (one row per scraped JSON record, keyed by project_id). Falls back to scraped_records
+    when scraped_data is empty for backward compatibility.
+    """
+    try:
+        logger.info(f'[API] Fetching ingested stats for project: {project_token}')
+
+        cursor = g.db.cursor()
+
+        def _norm_row(row):
+            if not row:
+                return {}
+            d = row if isinstance(row, dict) else dict(row)
+            return {k.lower() if isinstance(k, str) else k: v for k, v in d.items()}
+
+        # First get the project_id from token
+        cursor.execute(
+            'SELECT id FROM projects WHERE token = %s',
+            (project_token,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return jsonify({'error': 'Project not found'}), 404
+
+        project_id = row.get('id') if isinstance(row, dict) else row[0]
+        if isinstance(project_id, dict):
+            project_id = list(project_id.values())[0]
+
+        # Primary: scraped_data in Snowflake (canonical store for exports / analytics)
+        cursor.execute(
+            '''
+            SELECT
+                COUNT(DISTINCT run_id) AS total_runs,
+                COUNT(*) AS total_records,
+                MAX(created_at) AS last_extraction
+            FROM scraped_data
+            WHERE project_id = %s
+            ''',
+            (project_id,),
+        )
+        stats = _norm_row(cursor.fetchone())
+        total_runs = int(stats.get('total_runs') or 0)
+        total_records = int(stats.get('total_records') or 0)
+        last_extraction = stats.get('last_extraction')
+
+        if total_records == 0:
+            cursor.execute(
+                '''
+                SELECT
+                    COUNT(DISTINCT run_token) AS total_runs,
+                    COUNT(*) AS total_records,
+                    MAX(created_at) AS last_extraction
+                FROM scraped_records
+                WHERE project_id = %s
+                ''',
+                (project_id,),
+            )
+            fb = _norm_row(cursor.fetchone())
+            if int(fb.get('total_records') or 0) > 0:
+                total_runs = int(fb.get('total_runs') or 0)
+                total_records = int(fb.get('total_records') or 0)
+                last_extraction = fb.get('last_extraction') or last_extraction
+
+        cursor.execute(
+            '''
+            SELECT MAX(source_page) AS hp FROM scraped_records WHERE project_id = %s
+            ''',
+            (project_id,),
+        )
+        hp = _norm_row(cursor.fetchone()).get('hp')
+        pages_scraped = int(hp) if hp is not None else 0
+        if not pages_scraped:
+            cursor.execute(
+                'SELECT MAX(pages_scraped) AS mp FROM runs WHERE project_id = %s',
+                (project_id,),
+            )
+            mp = _norm_row(cursor.fetchone()).get('mp')
+            pages_scraped = int(mp) if mp is not None else 0
+
+        cursor.execute(
+            '''
+            SELECT r.run_token AS run_token, MAX(sd.created_at) AS run_time
+            FROM scraped_data sd
+            INNER JOIN runs r ON r.id = sd.run_id
+            WHERE sd.project_id = %s
+            GROUP BY r.run_token
+            ORDER BY run_time DESC
+            LIMIT 10
+            ''',
+            (project_id,),
+        )
+        runs = []
+        for run_row in cursor.fetchall():
+            nr = _norm_row(run_row)
+            runs.append({
+                'run_token': nr.get('run_token'),
+                'run_time': nr.get('run_time'),
+            })
+
+        if not runs:
+            cursor.execute(
+                '''
+                SELECT DISTINCT run_token, MAX(created_at) AS run_time
+                FROM scraped_records
+                WHERE project_id = %s
+                GROUP BY run_token
+                ORDER BY run_time DESC
+                LIMIT 10
+                ''',
+                (project_id,),
+            )
+            for run_row in cursor.fetchall():
+                nr = _norm_row(run_row)
+                runs.append({
+                    'run_token': nr.get('run_token'),
+                    'run_time': nr.get('run_time'),
+                })
+
+        result = {
+            'success': True,
+            'project_token': project_token,
+            'project_id': project_id,
+            'total_runs': total_runs,
+            'total_products': total_records,
+            'pages_scraped': pages_scraped,
+            'last_extraction': last_extraction,
+            'recent_runs': runs,
+        }
+
+        logger.info(f'[API] Ingested stats for {project_token}: {result}')
+        return jsonify(result), 200
+
+    except Exception as e:
+        logger.error(f'[API] Error getting ingested stats for {project_token}: {e}')
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e), 'success': False}), 500
 
 
@@ -1598,6 +1894,33 @@ def run_project(token: str):
         logger.info(
             f'[API] ✅ Project run started: {token}, Run token: {run_token}')
 
+        # Register run with auto-complete service for data persistence
+        try:
+            # Get project ID for the token
+            cursor = g.db.cursor()
+            cursor.execute('SELECT id FROM projects WHERE token = %s', (token,))
+            project_row = cursor.fetchone()
+            if project_row:
+                project_id = project_row.get('id') if isinstance(project_row, dict) else project_row[0]
+                starting_page = metadata.get('current_page_scraped', 0) + 1 if metadata else 1
+
+                register_run_for_completion(
+                    run_token=run_token,
+                    project_id=project_id,
+                    project_token=token,
+                    starting_page=starting_page,
+                    auto_continue=False  # Manual control for now
+                )
+                logger.info(f'[API] ✅ Run {run_token[:8]}... registered with auto-complete service')
+                # Persist active run in Snowflake for monitoring / restarts
+                try:
+                    g.db.ensure_run_started(project_id, run_token, 'running', 0)
+                    logger.info(f'[API] ✅ Run {run_token[:8]}... stored in Snowflake RUNS')
+                except Exception as db_err:
+                    logger.warning(f'[API] Could not persist run row: {db_err}')
+        except Exception as reg_err:
+            logger.warning(f'[API] Could not register run with auto-complete service: {reg_err}')
+
         # Schedule auto-stop check in background
         if metadata:
             logger.info(
@@ -1653,6 +1976,148 @@ def batch_run_projects():
     except Exception as e:
         logger.error(f'[BATCH] Error in batch run: {str(e)}', exc_info=True)
         return jsonify({'error': f'Batch run failed: {str(e)}', 'success': False}), 500
+
+
+@app.route('/api/store-analytics', methods=['POST'])
+def store_analytics():
+    """
+    Store analytics data to database from frontend
+    
+    Request body:
+    {
+        "project_token": "...",
+        "run_token": "...",
+        "analytics_data": {...},
+        "records": [...],
+        "csv_data": "..." (optional)
+    }
+    
+    Returns:
+    {
+        "success": true/false,
+        "message": "...",
+        "records_stored": number
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'success': False, 'error': 'No data provided'}), 400
+        
+        project_token = data.get('project_token')
+        run_token = data.get('run_token')
+        analytics_data = data.get('analytics_data', {})
+        records = data.get('records', [])
+        csv_data = data.get('csv_data')
+        
+        # Validate required fields
+        if not project_token:
+            return jsonify({'success': False, 'error': 'project_token is required'}), 400
+        if not run_token:
+            return jsonify({'success': False, 'error': 'run_token is required'}), 400
+        if not isinstance(records, list):
+            return jsonify({'success': False, 'error': 'records must be an array'}), 400
+        
+        logger.info(f'[STORE-ANALYTICS] Storing data for project {project_token}, run {run_token[:12]}..., records: {len(records)}')
+        
+        # Store to database
+        try:
+            result = g.db.store_analytics_data(
+                project_token=project_token,
+                run_token=run_token,
+                analytics_data=analytics_data,
+                records=records,
+                csv_data=csv_data
+            )
+            
+            if result:
+                logger.info(f'[STORE-ANALYTICS] ✅ Successfully stored {len(records)} records for {project_token}')
+                return jsonify({
+                    'success': True,
+                    'message': 'Data stored successfully',
+                    'records_stored': len(records)
+                }), 200
+            else:
+                logger.error(f'[STORE-ANALYTICS] ❌ Database storage returned False for {project_token}')
+                return jsonify({
+                    'success': False,
+                    'error': 'Database storage failed'
+                }), 500
+                
+        except Exception as db_err:
+            logger.error(f'[STORE-ANALYTICS] ❌ Database error: {db_err}', exc_info=True)
+            return jsonify({
+                'success': False,
+                'error': f'Database error: {str(db_err)}'
+            }), 500
+            
+    except Exception as e:
+        logger.error(f'[STORE-ANALYTICS] ❌ Error in store_analytics: {str(e)}', exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/get-analytics', methods=['GET'])
+def get_analytics():
+    """
+    Retrieve analytics data from database
+    
+    Query parameters:
+    - project_token: The project token to retrieve data for (required)
+    
+    Returns:
+    {
+        "success": true/false,
+        "found": true/false,
+        "data": {...}, (if found)
+        "error": "..." (if not found or error)
+    }
+    """
+    try:
+        project_token = request.args.get('project_token')
+        
+        if not project_token:
+            return jsonify({'success': False, 'error': 'project_token is required'}), 400
+        
+        logger.info(f'[GET-ANALYTICS] Retrieving data for project {project_token}')
+        
+        # Get from database
+        try:
+            result = g.db.get_analytics_data(project_token)
+            
+            if result:
+                records_count = len(result.get('raw_data', []))
+                logger.info(f'[GET-ANALYTICS] ✅ Found data with {records_count} records for {project_token}')
+                return jsonify({
+                    'success': True,
+                    'found': True,
+                    'data': result,
+                    'records_count': records_count
+                }), 200
+            else:
+                logger.info(f'[GET-ANALYTICS] No data found for {project_token}')
+                return jsonify({
+                    'success': True,
+                    'found': False,
+                    'message': 'No cached data found'
+                }), 200
+                
+        except Exception as db_err:
+            logger.error(f'[GET-ANALYTICS] ❌ Database error: {db_err}', exc_info=True)
+            return jsonify({
+                'success': False,
+                'error': f'Database error: {str(db_err)}'
+            }), 500
+            
+    except Exception as e:
+        logger.error(f'[GET-ANALYTICS] ❌ Error in get_analytics: {str(e)}', exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 
 @app.route('/api/projects/schedule', methods=['POST'])
@@ -2036,6 +2501,144 @@ def export_product_data(project_id: int):
     except Exception as e:
         logger.error(f'[API] Error exporting product data: {e}')
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/projects/<int:project_id>/scraped-data', methods=['GET'])
+def get_scraped_data(project_id: int):
+    """
+    Get raw scraped data from Snowflake for a project
+
+    Query parameters:
+    - limit: Number of records to return (default: 100, max: 1000)
+    - offset: Pagination offset (default: 0)
+    """
+    try:
+        limit = min(int(request.args.get('limit', 100)), 1000)
+        offset = int(request.args.get('offset', 0))
+
+        cursor = g.db.cursor()
+
+        # Get scraped_data from Snowflake
+        cursor.execute(
+            '''
+            SELECT id, run_id, data_key, data_value, created_at
+            FROM scraped_data
+            WHERE project_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s OFFSET %s
+            ''',
+            (project_id, limit, offset)
+        )
+
+        rows = cursor.fetchall()
+
+        data = []
+        for row in rows:
+            try:
+                row_dict = dict(row) if hasattr(row, 'keys') else {
+                    'id': row[0], 'run_id': row[1], 'data_key': row[2],
+                    'data_value': row[3], 'created_at': row[4]
+                }
+                # Parse the JSON data
+                parsed = json.loads(row_dict.get('data_value', '{}'))
+                data.append(parsed)
+            except Exception as parse_err:
+                logger.warning(f'[API] Failed to parse scraped_data row: {parse_err}')
+                continue
+
+        # Get total count
+        cursor.execute(
+            'SELECT COUNT(*) as total FROM scraped_data WHERE project_id = %s',
+            (project_id,)
+        )
+        count_row = cursor.fetchone()
+        total = count_row.get('total', 0) if isinstance(count_row, dict) else (count_row[0] if count_row else 0)
+
+        return jsonify({
+            'success': True,
+            'project_id': project_id,
+            'count': len(data),
+            'total': total,
+            'limit': limit,
+            'offset': offset,
+            'data': data
+        }), 200
+
+    except Exception as e:
+        logger.error(f'[API] Error fetching scraped data: {e}')
+        return jsonify({'error': str(e), 'success': False}), 500
+
+
+@app.route('/api/projects/<project_token>/scraped-data', methods=['GET'])
+def get_scraped_data_by_token(project_token: str):
+    """
+    Get raw scraped data from Snowflake by project token
+    """
+    try:
+        # First get project_id from token
+        cursor = g.db.cursor()
+        cursor.execute('SELECT id FROM projects WHERE token = %s', (project_token,))
+        row = cursor.fetchone()
+
+        if not row:
+            return jsonify({'error': 'Project not found', 'success': False}), 404
+
+        project_id = row.get('id') if isinstance(row, dict) else row[0]
+
+        limit = min(int(request.args.get('limit', 100)), 1000)
+        offset = int(request.args.get('offset', 0))
+
+        # Get scraped_data from Snowflake
+        cursor.execute(
+            '''
+            SELECT id, run_id, data_key, data_value, created_at
+            FROM scraped_data
+            WHERE project_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s OFFSET %s
+            ''',
+            (project_id, limit, offset)
+        )
+
+        rows = cursor.fetchall()
+
+        data = []
+        for row in rows:
+            try:
+                row_dict = dict(row) if hasattr(row, 'keys') else {
+                    'id': row[0], 'run_id': row[1], 'data_key': row[2],
+                    'data_value': row[3], 'created_at': row[4]
+                }
+                # Parse the JSON data
+                parsed = json.loads(row_dict.get('data_value', '{}'))
+                data.append(parsed)
+            except Exception as parse_err:
+                logger.warning(f'[API] Failed to parse scraped_data row: {parse_err}')
+                continue
+
+        # Get total count
+        cursor.execute(
+            'SELECT COUNT(*) as total FROM scraped_data WHERE project_id = %s',
+            (project_id,)
+        )
+        count_row = cursor.fetchone()
+        total = count_row.get('total', 0) if isinstance(count_row, dict) else (count_row[0] if count_row else 0)
+
+        return jsonify({
+            'success': True,
+            'project_id': project_id,
+            'project_token': project_token,
+            'count': len(data),
+            'total': total,
+            'limit': limit,
+            'offset': offset,
+            'data': data
+        }), 200
+
+    except Exception as e:
+        logger.error(f'[API] Error fetching scraped data: {e}')
+        return jsonify({'error': str(e), 'success': False}), 500
+
 
 # ========== INCREMENTAL SCRAPING ENDPOINTS ==========
 

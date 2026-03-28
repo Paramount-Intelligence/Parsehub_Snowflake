@@ -103,8 +103,8 @@ export default function AllProjectsAnalyticsModal({
               `/api/analytics?token=${project.token}`,
               { headers: getApiHeaders() },
             );
-            if (response.status === 200) {
-              const analytics = response.data;
+            if (response.ok) {
+              const analytics = await response.json();
               return {
                 ...project,
                 analytics,

@@ -87,11 +87,11 @@ export function useRealTimeMonitoring(): UseRealTimeMonitoringReturn {
           }),
         });
 
-        if (!response.status === 200) {
+        if (!response.ok) {
           throw new Error('Failed to start monitoring');
         }
 
-        const result = response.data;
+        const result = await response.json();
 
         if (!result.success && !result.sessionId) {
           throw new Error(result.error || 'Failed to start monitoring');
@@ -143,11 +143,11 @@ export function useRealTimeMonitoring(): UseRealTimeMonitoringReturn {
           headers: getApiHeaders(),
         });
 
-        if (!response.status === 200) {
+        if (!response.ok) {
           throw new Error('Failed to fetch status');
         }
 
-        const result = response.data;
+        const result = await response.json();
 
         setSession((prev) => {
           if (!prev) return null;
@@ -187,11 +187,11 @@ export function useRealTimeMonitoring(): UseRealTimeMonitoringReturn {
           { headers: getApiHeaders() }
         );
 
-        if (!response.status === 200) {
+        if (!response.ok) {
           throw new Error('Failed to fetch data');
         }
 
-        const result = response.data;
+        const result = await response.json();
 
         // Add new records (avoiding duplicates)
         setData((prev) => {
@@ -300,15 +300,21 @@ export function useRealTimeMonitoring(): UseRealTimeMonitoringReturn {
   };
 }
 
-// Logger utility
+// Logger utility - only logs in development to reduce console noise
 const logger = {
   error: (message: string, error?: any) => {
-    console.error(`[useRealTimeMonitoring] ${message}`, error);
+    if (process.env.NODE_ENV === 'development') {
+      console.error(`[useRealTimeMonitoring] ${message}`, error);
+    }
   },
   info: (message: string) => {
-    console.log(`[useRealTimeMonitoring] ${message}`);
+    if (process.env.NODE_ENV === 'development') {
+      console.log(`[useRealTimeMonitoring] ${message}`);
+    }
   },
   warn: (message: string) => {
-    console.warn(`[useRealTimeMonitoring] ${message}`);
+    if (process.env.NODE_ENV === 'development') {
+      console.warn(`[useRealTimeMonitoring] ${message}`);
+    }
   },
 };

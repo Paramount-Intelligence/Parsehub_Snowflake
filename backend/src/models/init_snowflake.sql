@@ -95,6 +95,22 @@ CREATE TABLE IF NOT EXISTS scraped_data (
     FOREIGN KEY (project_token) REFERENCES projects(token)
 );
 
+-- Scraped Records table - used by metadata-driven resume scraper
+CREATE TABLE IF NOT EXISTS scraped_records (
+    id INTEGER IDENTITY(1,1) PRIMARY KEY,
+    session_id INTEGER,
+    project_id INTEGER NOT NULL,
+    run_token VARCHAR(255) NOT NULL,
+    page_number INTEGER,
+    source_page INTEGER DEFAULT 0,
+    data_hash VARCHAR(64),
+    data_json TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+    FOREIGN KEY (session_id) REFERENCES monitoring_sessions(id),
+    FOREIGN KEY (project_id) REFERENCES projects(id),
+    UNIQUE(run_token, page_number, data_hash)
+);
+
 -- Metrics table for tracking analytics
 CREATE TABLE IF NOT EXISTS metrics (
     id INTEGER PRIMARY KEY,

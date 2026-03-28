@@ -90,10 +90,11 @@ class GroupRunService:
         
         try:
             url = f'https://www.parsehub.com/api/v2/projects/{token}/run'
-            data = {'api_key': self.parsehub_api_key, 'pages': 1}
+            params = {'api_key': self.parsehub_api_key}
+            data = {'pages': 1}
             
             logger.info(f'[GROUP_RUN] POST {url}')
-            response = requests.post(url, data=data, timeout=10)
+            response = requests.post(url, params=params, data=data, timeout=10)
             
             logger.info(f'[GROUP_RUN] Response status: {response.status_code}')
             

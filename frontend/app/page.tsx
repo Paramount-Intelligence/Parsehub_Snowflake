@@ -197,9 +197,9 @@ export default function Home() {
 
       console.log("[Home] Fetching projects from:", url);
 
-      // Use 30 second timeout for paginated requests (not 300 seconds!)
+      // Use 120 second timeout for paginated requests - backend can be slow
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 30000);
+      const timeoutId = setTimeout(() => controller.abort(), 120000);
 
       const response = await apiClient.get(url, {
         signal: controller.signal,
@@ -290,7 +290,10 @@ export default function Home() {
       setLoading(false);
     } catch (err) {
       const errorMsg = extractErrorMessage(err);
-      console.error("[Home] Error fetching projects:", errorMsg);
+      // Only log non-network errors to avoid console spam
+      if (!isBackendDown(err)) {
+        console.error("[Home] Error fetching projects:", errorMsg);
+      }
       setError(errorMsg);
       setBackendDown(isBackendDown(err));
       setLoading(false);

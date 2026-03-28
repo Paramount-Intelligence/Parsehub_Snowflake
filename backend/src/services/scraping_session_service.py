@@ -43,23 +43,32 @@ class ScrapingSessionService:
                 'project_token': project_token,
                 'total_pages_target': total_pages_target
             }
-        except sqlite3.IntegrityError:
-            # Session already exists for this project_token and target
-            cursor.execute('''
-                SELECT id, status FROM scraping_sessions
-                WHERE project_token = %s AND total_pages_target = %s
-            ''', (project_token, total_pages_target))
-            
-            result = cursor.fetchone()
-            if result:
-                print(f"[WARNING] Session already exists for {project_token} with target {total_pages_target}", file=sys.stderr)
-                return {
-                    'success': True,
-                    'session_id': result[0],
-                    'status': result[1],
-                    'existing': True
-                }
         except Exception as e:
+            # Check if it's a duplicate key error (UNIQUE constraint violation)
+            error_msg = str(e).lower()
+            if 'unique' in error_msg or 'duplicate' in error_msg or 'constraint' in error_msg:
+                # Session already exists for this project_token and target
+                try:
+                    cursor.execute('''
+                        SELECT id, status FROM scraping_sessions
+                        WHERE project_token = %s AND total_pages_target = %s
+                    ''', (project_token, total_pages_target))
+                    
+                    result = cursor.fetchone()
+                    if result:
+                        result_id = result.get('id') if isinstance(result, dict) else result[0]
+                        result_status = result.get('status') if isinstance(result, dict) else result[1]
+                        print(f"[WARNING] Session already exists for {project_token} with target {total_pages_target}", file=sys.stderr)
+                        return {
+                            'success': True,
+                            'session_id': result_id,
+                            'status': result_status,
+                            'existing': True
+                        }
+                except Exception as inner_e:
+                    print(f"[ERROR] Error checking existing session: {str(inner_e)}", file=sys.stderr)
+                    return {'success': False, 'error': str(inner_e)}
+            
             print(f"[ERROR] Error creating session: {str(e)}", file=sys.stderr)
             return {'success': False, 'error': str(e)}
 

@@ -1,8 +1,6 @@
 import { getApiBaseUrl, getApiHeaders } from "@/lib/apiBase";
 import { NextRequest, NextResponse } from 'next/server';
 
-const BACKEND_URL = getApiBaseUrl();
-
 /**
  * POST /api/metadata/import
  * Imports metadata from Excel file
@@ -10,6 +8,7 @@ const BACKEND_URL = getApiBaseUrl();
  */
 export async function POST(request: NextRequest) {
   try {
+    const BACKEND_URL = getApiBaseUrl();
     const formData = await request.formData();
     const file = formData.get('file');
 

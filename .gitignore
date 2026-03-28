@@ -2,6 +2,7 @@
 # ENVIRONMENT & SECRETS (CRITICAL - NEVER COMMIT)
 # ============================================
 .env
+backend/.env
 .env.local
 .env.*.local
 .env.production

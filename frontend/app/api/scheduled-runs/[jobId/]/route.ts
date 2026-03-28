@@ -1,5 +1,5 @@
 import { NextRequest } from 'next/server';
-import { proxyToBackend } from '../../_proxy';
+import { proxyToBackend } from '../../../_proxy';
 
 export async function DELETE(
   request: NextRequest,

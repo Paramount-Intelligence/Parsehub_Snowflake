@@ -39,12 +39,12 @@ class ScheduledRunService:
 
         try:
             conn = self.db.connect()
-            cursor = self.db.cursor()
+            cursor = conn.cursor()
             
             query = """
             SELECT job_id, project_token, schedule_type, scheduled_time, frequency, 
                    day_of_week, pages, created_at 
-            FROM scheduled_runs 
+            FROM SCHEDULED_RUNS 
             WHERE active = TRUE
             """
             cursor.execute(query)
@@ -52,17 +52,34 @@ class ScheduledRunService:
             
             for row in result:
                 try:
-                    job_id = row[0]
-                    project_token = row[1]
-                    schedule_type = row[2]
-                    scheduled_time = row[3]
-                    frequency = row[4]
-                    day_of_week = row[5]
-                    pages = int(row[6])
+                    # Handle both dict (Snowflake) and tuple (SQLite) row formats
+                    if isinstance(row, dict):
+                        row_lower = {k.lower(): v for k, v in row.items()}
+                        job_id = row_lower['job_id']
+                        project_token = row_lower['project_token']
+                        schedule_type = row_lower['schedule_type']
+                        scheduled_time = row_lower['scheduled_time']
+                        frequency = row_lower['frequency']
+                        day_of_week = row_lower['day_of_week']
+                        pages = int(row_lower['pages'])
+                        created_at = row_lower['created_at']
+                    else:
+                        # Fallback for tuple rows
+                        job_id = row[0]
+                        project_token = row[1]
+                        schedule_type = row[2]
+                        scheduled_time = row[3]
+                        frequency = row[4]
+                        day_of_week = row[5]
+                        pages = int(row[6])
+                        created_at = row[7]
 
                     # Recreate scheduler job
                     if schedule_type == 'once':
                         run_time = datetime.fromisoformat(scheduled_time)
+                        # Ensure timezone-aware comparison
+                        if run_time.tzinfo is None:
+                            run_time = run_time.replace(tzinfo=LOCAL_TZ)
                         if run_time > datetime.now(LOCAL_TZ):
                             self.scheduler.add_job(
                                 self._run_project,
@@ -105,7 +122,7 @@ class ScheduledRunService:
                         'time': scheduled_time if schedule_type == 'recurring' else None,
                         'day_of_week': day_of_week,
                         'pages': pages,
-                        'created_at': row[7]
+                        'created_at': created_at
                     }
                     logger.info(f"[OK] Loaded from DB: {job_id}")
                 except Exception as e:
@@ -136,6 +153,10 @@ class ScheduledRunService:
     def schedule_once(self, project_token: str, scheduled_time: str, pages: int = 1) -> dict:
         """Schedule project to run once at specific time"""
         try:
+            # Log early to debug if this method is even being called
+            logger.info(f"[SCHEDULE] schedule_once called: token={project_token}, time={scheduled_time}, pages={pages}")
+            logger.info(f"[SCHEDULE] self.db is {'SET' if self.db else 'NOT SET'}, scheduler.running={self.scheduler.running}")
+            
             # Validate pages
             if pages < 1:
                 return {'success': False, 'error': 'Pages must be at least 1'}
@@ -143,12 +164,19 @@ class ScheduledRunService:
             # Parse and validate scheduled time
             run_time = datetime.fromisoformat(scheduled_time)
             
+            # Ensure timezone-aware for consistent comparison
+            if run_time.tzinfo is None:
+                run_time = run_time.replace(tzinfo=LOCAL_TZ)
+            
             # Check if scheduled time is in the past
-            now = datetime.now(LOCAL_TZ) if run_time.tzinfo else datetime.now()
+            now = datetime.now(LOCAL_TZ)
             if run_time < now:
-                return {'success': False, 'error': f'Scheduled time must be in the future. Current time: {now.isoformat()}'}
+                error_msg = f'Scheduled time must be in the future. Current time: {now.isoformat()}'
+                logger.error(f"[SCHEDULE] Time in past: {error_msg}")
+                return {'success': False, 'error': error_msg}
             
             job_id = f"{project_token}_{run_time.timestamp()}"
+            logger.info(f"[SCHEDULE] Generated job_id: {job_id}")
 
             self.scheduler.add_job(
                 self._run_project,
@@ -158,20 +186,26 @@ class ScheduledRunService:
                 id=job_id,
                 replace_existing=True
             )
+            logger.info(f"[SCHEDULE] APScheduler job added: {job_id}")
 
+            # Store with timezone-aware ISO format
             run_data = {
                 'project_token': project_token,
                 'type': 'once',
-                'scheduled_time': scheduled_time,
+                'scheduled_time': run_time.isoformat(),  # Store timezone-aware format
                 'pages': pages,
                 'created_at': datetime.now().isoformat()
             }
             
             self.scheduled_runs[job_id] = run_data
+            logger.info(f"[SCHEDULE] Stored in memory: {job_id}")
 
             # Save to database
             if self.db:
+                logger.info(f"[SCHEDULE] Database available, saving to DB...")
                 self._save_to_database(job_id, run_data)
+            else:
+                logger.warning(f"[SCHEDULE] Database NOT available, skipping DB save")
 
             logger.info(f"[OK] Scheduled once: {project_token} at {scheduled_time}")
             return {
@@ -181,13 +215,19 @@ class ScheduledRunService:
                 'scheduled_time': scheduled_time
             }
         except Exception as e:
+            import traceback
             logger.error(f"[ERROR] Schedule failed: {e}")
+            logger.error(f"[ERROR] Traceback: {traceback.format_exc()}")
             return {'success': False, 'error': str(e)}
 
     def schedule_recurring(self, project_token: str, scheduled_time: str, frequency: str,
                           day_of_week: str = None, pages: int = 1) -> dict:
         """Schedule project to run recurring"""
         try:
+            # Log early to debug
+            logger.info(f"[SCHEDULE] schedule_recurring called: token={project_token}, time={scheduled_time}, freq={frequency}")
+            logger.info(f"[SCHEDULE] self.db is {'SET' if self.db else 'NOT SET'}, scheduler.running={self.scheduler.running}")
+            
             # Validate pages
             if pages < 1:
                 return {'success': False, 'error': 'Pages must be at least 1'}
@@ -249,7 +289,10 @@ class ScheduledRunService:
 
             # Save to database
             if self.db:
+                logger.info(f"[SCHEDULE] Database available, saving recurring to DB...")
                 self._save_to_database(job_id, run_data)
+            else:
+                logger.warning(f"[SCHEDULE] Database NOT available, skipping DB save")
 
             logger.info(f"[OK] Scheduled recurring: {project_token} {frequency} at {time_str}")
             return {
@@ -260,7 +303,9 @@ class ScheduledRunService:
                 'time': time_str
             }
         except Exception as e:
+            import traceback
             logger.error(f"[ERROR] Recurring schedule failed: {e}")
+            logger.error(f"[ERROR] Traceback: {traceback.format_exc()}")
             return {'success': False, 'error': str(e)}
 
     def cancel_scheduled_run(self, job_id: str) -> dict:
@@ -274,8 +319,8 @@ class ScheduledRunService:
             if self.db:
                 try:
                     conn = self.db.connect()
-                    cursor = self.db.cursor()
-                    query = "UPDATE scheduled_runs SET active = FALSE WHERE job_id = %s"
+                    cursor = conn.cursor()
+                    query = "UPDATE SCHEDULED_RUNS SET active = FALSE WHERE job_id = %s"
                     cursor.execute(query, (job_id,))
                     conn.commit()
                     self.db.disconnect()
@@ -293,53 +338,29 @@ class ScheduledRunService:
             return {'success': False, 'error': str(e)}
 
     def get_scheduled_runs(self) -> list:
-        """Get all scheduled runs from database and memory"""
+        """Get all scheduled runs"""
+        # Return runs with job_id included
         result = []
-        
-        # First, load active runs from database to ensure up-to-date data
-        if self.db:
-            try:
-                conn = self.db.connect()
-                cursor = self.db.cursor()
-                query = "SELECT job_id, project_token, schedule_type, scheduled_time, frequency, day_of_week, pages, created_at FROM scheduled_runs WHERE active = TRUE ORDER BY created_at DESC"
-                cursor.execute(query)
-                db_runs = cursor.fetchall()
-                self.db.disconnect()
-                
-                # Sync database runs with in-memory dict
-                for row in db_runs:
-                    job_id = row[0]
-                    if job_id not in self.scheduled_runs:
-                        # Add to in-memory dict if not already there
-                        self.scheduled_runs[job_id] = {
-                            'project_token': row[1],
-                            'type': row[2],
-                            'scheduled_time': row[3] if row[2] == 'once' else None,
-                            'frequency': row[4] if row[2] == 'recurring' else None,
-                            'time': row[3] if row[2] == 'recurring' else None,
-                            'day_of_week': row[5],
-                            'pages': int(row[6]),
-                            'created_at': row[7]
-                        }
-            except Exception as e:
-                logger.warning(f"[WARN] Could not load from database in get_scheduled_runs: {e}")
-        
-        # Return runs from in-memory dict with job_id included
         for job_id, run_data in self.scheduled_runs.items():
             run_with_id = dict(run_data)
             run_with_id['job_id'] = job_id
             result.append(run_with_id)
-        
         return result
 
     def _save_to_database(self, job_id: str, run_data: dict):
         """Save scheduled run to database"""
         try:
+            logger.info(f"[DB] Attempting to save job_id={job_id} to database")
+            logger.info(f"[DB] run_data keys: {list(run_data.keys())}")
+            
             conn = self.db.connect()
-            cursor = self.db.cursor()
+            logger.info(f"[DB] Connection obtained: {conn}")
+            
+            cursor = conn.cursor()
+            logger.info(f"[DB] Cursor obtained")
             
             query = """
-            INSERT INTO scheduled_runs 
+            INSERT INTO SCHEDULED_RUNS 
             (job_id, project_token, schedule_type, scheduled_time, frequency, day_of_week, pages, created_at, active)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """
@@ -355,13 +376,20 @@ class ScheduledRunService:
                 run_data.get('created_at'),
                 True  # active flag - set to True for all scheduled runs
             )
+            logger.info(f"[DB] Query params: job_id={params[0]}, project_token={params[1]}, type={params[2]}, scheduled_time={params[3]}")
             
             cursor.execute(query, params)
+            logger.info(f"[DB] Query executed")
+            
             conn.commit()
+            logger.info(f"[DB] Transaction committed")
+            
             self.db.disconnect()
             logger.info(f"[OK] Saved to DB: {job_id}")
         except Exception as e:
+            import traceback
             logger.error(f"[ERROR] Failed to save to database: {e}")
+            logger.error(f"[ERROR] Traceback: {traceback.format_exc()}")
             try:
                 self.db.disconnect()
             except:
@@ -372,8 +400,9 @@ class ScheduledRunService:
         try:
             logger.info(f"[EXECUTE] Running {project_token} ({pages} pages)")
             url = f'{self.base_url}/projects/{project_token}/run'
-            data = {'api_key': self.api_key, 'pages': pages}
-            response = requests.post(url, data=data, timeout=10)
+            params = {'api_key': self.api_key}
+            data = {'pages': pages}
+            response = requests.post(url, params=params, data=data, timeout=10)
 
             if response.status_code == 200:
                 run_info = response.json()

@@ -1,8 +1,6 @@
 import { getApiBaseUrl, getApiHeaders } from "@/lib/apiBase";
 import { NextRequest, NextResponse } from 'next/server';
 
-const BACKEND_URL = getApiBaseUrl();
-
 /**
  * GET /api/import-history
  * Fetches Excel import batch history
@@ -10,6 +8,9 @@ const BACKEND_URL = getApiBaseUrl();
  */
 export async function GET(request: NextRequest) {
   try {
+    // Get backend URL at runtime (not build time)
+    const BACKEND_URL = getApiBaseUrl();
+    
     // Extract query parameters
     const searchParams = request.nextUrl.searchParams;
     const limit = searchParams.get('limit') || '50';

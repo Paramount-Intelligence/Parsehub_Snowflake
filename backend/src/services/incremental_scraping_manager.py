@@ -1,35 +1,66 @@
 #!/usr/bin/env python3
 """
-Incremental Scraping Manager
-Automatically manages projects that need continuation scraping based on metadata
+Incremental Scraping Manager (Refactored)
+Orchestrates chunk-based (10-page batch) pagination using backend-owned URL generation
+No more continuation projects or continuation runs - single project handles all batches
+
+Architecture:
+- Reads checkpoint from DB (current_page_scraped)
+- Generates next 10-page batch URLs
+- Triggers ParseHub run with first batch URL
+- Polls for completion and fetches results
+- Stores with source_page tracking
+- Updates checkpoint (max source_page from batch)
+- Repeats until no data returned
+
+Key improvements:
+✓ Single ParseHub project (no project duplication)
+✓ Backend-owned batching logic
+✓ Proper checkpoint resume
+✓ Idempotent batch processing
+✓ Deduplication via source_page tracking
 """
-import requests
-import json
+
 import os
-import time
-from datetime import datetime
-from dotenv import load_dotenv
 import sys
+import time
+import logging
+import requests
+from datetime import datetime
 from pathlib import Path
+from dotenv import load_dotenv
 
 root_dir = Path(__file__).parent.parent.parent  # backend/
 if str(root_dir) not in sys.path:
     sys.path.insert(0, str(root_dir))
 
 from src.models.database import ParseHubDatabase
+from src.services.chunk_pagination_orchestrator import ChunkPaginationOrchestrator
 
 load_dotenv('.env')
 
-API_KEY = os.getenv('PARSEHUB_API_KEY')
-BASE_URL = 'https://www.parsehub.com/api/v2'
+BASE_URL = os.getenv('PARSEHUB_BASE_URL', 'https://www.parsehub.com/api/v2')
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
 class IncrementalScrapingManager:
+    """
+    Refactored manager using chunk-based orchestration instead of continuation projects
+    """
+    
     def __init__(self):
         self.db = ParseHubDatabase()
-        self.api_key = API_KEY
+        self.orchestrator = ChunkPaginationOrchestrator()
+
+        self.api_key = os.getenv('PARSEHUB_API_KEY')
         if not self.api_key:
-            raise Exception("PARSEHUB_API_KEY not configured")
+            raise ValueError("PARSEHUB_API_KEY not configured")
 
     def check_and_match_pages(self):
         """
@@ -123,6 +154,55 @@ class IncrementalScrapingManager:
             traceback.print_exc()
             return []
 
+    def _normalize_http_url(self, url: str) -> str:
+        u = (url or '').strip()
+        if not u:
+            return ''
+        if not u.startswith(('http://', 'https://')):
+            return 'https://' + u.lstrip('/')
+        return u
+
+    def _start_url_from_parsehub_project(self, project_details: dict) -> str:
+        """ParseHub GET /projects/{token} exposes main_site; start_url is rarely present."""
+        for key in ('start_url', 'main_site', 'startUrl', 'mainSite'):
+            val = project_details.get(key)
+            if val and str(val).strip():
+                return self._normalize_http_url(str(val).strip())
+        return ''
+
+    def _fetch_start_url_from_db(self, project_id: int) -> str:
+        try:
+            conn = self.db.connect()
+            cursor = conn.cursor()
+            cursor.execute(
+                '''
+                SELECT m.last_known_url, m.website_url, p.main_site
+                FROM metadata m
+                JOIN projects p ON p.id = m.project_id
+                WHERE m.project_id = %s
+                ''',
+                (project_id,),
+            )
+            row = cursor.fetchone()
+            conn.close()
+            if not row:
+                return ''
+            if isinstance(row, dict):
+                candidates = [
+                    row.get('last_known_url'),
+                    row.get('website_url'),
+                    row.get('main_site'),
+                ]
+            else:
+                candidates = [row[0], row[1], row[2]]
+            for c in candidates:
+                if c and str(c).strip():
+                    return self._normalize_http_url(str(c).strip())
+            return ''
+        except Exception as e:
+            print(f"  Warning: DB fallback for start URL failed: {e}")
+            return ''
+
     def trigger_continuation_run(self, project_token, project_id, start_page,
                                  total_pages, pages_to_scrape, project_name):
         """
@@ -139,12 +219,13 @@ class IncrementalScrapingManager:
                     'error': 'Could not fetch project details'
                 }
 
-            # Get the project's start URL
-            start_url = project_details.get('start_url', '')
+            start_url = self._start_url_from_parsehub_project(project_details)
+            if not start_url:
+                start_url = self._fetch_start_url_from_db(project_id)
             if not start_url:
                 return {
                     'success': False,
-                    'error': 'Project has no start URL'
+                    'error': 'Project has no start URL (ParseHub main_site empty and no metadata URL)'
                 }
 
             print(f"  Original start URL: {start_url}")
@@ -332,34 +413,17 @@ class IncrementalScrapingManager:
 
     def store_continuation_run(self, original_project_id: int, continuation_token: str,
                                run_token: str, start_page: int, pages_count: int):
-        """Store information about the continuation run in database"""
+        """Store information about the continuation run in database (Snowflake-safe id)."""
         try:
-            conn = self.db.connect()
-            cursor = self.db.cursor()
-
-            # Create continuation run record
-            cursor.execute('''
-                INSERT INTO runs (
-                    project_id, run_token, status, pages_scraped,
-                    start_time, is_continuation, created_at
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ''', (
+            rid = self.db.ensure_run_started(
                 original_project_id,
                 run_token,
-                'starting',
-                pages_count,
-                datetime.now(),
-                True,  # is_continuation
-                datetime.now()
-            ))
-
-            conn.commit()
-            conn.close()
-
-            print(
-                f"  Stored continuation run in database (ID: {cursor.lastrowid})")
-
+                status='starting',
+                pages_scraped=pages_count,
+                is_continuation=True,
+            )
+            if rid:
+                print(f"  Stored continuation run in database (ID: {rid})")
         except Exception as e:
             print(f"Error storing continuation run: {e}")
 

@@ -10,7 +10,7 @@ if str(root_dir) not in sys.path:
     sys.path.insert(0, str(root_dir))
 
 from src.models.database import ParseHubDatabase
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 
 import json
@@ -62,7 +62,7 @@ class AnalyticsService:
                     ORDER BY created_at DESC
                 ''', (project_id,))
 
-                runs = [dict(row) if isinstance(row, sqlite3.Row) else dict(zip([d[0] for d in cursor.description], row)) for row in cursor.fetchall()]
+                runs = [dict(row) if isinstance(row, dict) else dict(zip([d[0].lower() for d in cursor.description], row)) for row in cursor.fetchall()]
             except Exception as e:
                 print(f"Error querying runs: {e}", file=sys.stderr)
                 runs = []
@@ -76,8 +76,9 @@ class AnalyticsService:
                     LIMIT 5
                 ''', (project_id,))
 
-                recovery_ops = [dict(row) if isinstance(row, sqlite3.Row) else dict(zip([d[0] for d in cursor.description], row)) for row in cursor.fetchall()]
+                recovery_ops = [dict(row) if isinstance(row, dict) else dict(zip([d[0].lower() for d in cursor.description], row)) for row in cursor.fetchall()]
             except Exception as e:
+
                 print(f"Error querying recovery ops: {e}", file=sys.stderr)
                 recovery_ops = []
 

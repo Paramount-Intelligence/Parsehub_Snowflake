@@ -17,7 +17,7 @@ const apiClient: AxiosInstance = axios.create({
         'Content-Type': 'application/json',
         ...getApiHeaders(),
     },
-    timeout: 30_000,
+    timeout: 120_000,  // 120s timeout for slow backend operations
 });
 
 // Response interceptor — turn network/connection errors into readable messages
@@ -31,7 +31,7 @@ apiClient.interceptors.response.use(
             error.code === 'ECONNABORTED';
 
         if (isNetworkError) {
-            console.error('[apiClient] Network error — backend unreachable');
+            // Silently handle network errors - don't spam console
             return Promise.reject({
                 isNetworkError: true,
                 message: 'Backend API is currently unreachable. Please check your connection or try again later.',

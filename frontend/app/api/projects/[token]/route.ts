@@ -7,9 +7,9 @@ const PARSEHUB_BASE_URL = process.env.PARSEHUB_BASE_URL || 'https://www.parsehub
 
 export async function GET(
   request: NextRequest,
-  { params }: { params: { token: string } }
+  { params }: { params: Promise<{ token: string }> }
 ) {
-  const token = params.token;
+  const { token } = await params;
   if (!token) {
     return NextResponse.json({ error: 'Project token is required' }, { status: 400 });
   }
