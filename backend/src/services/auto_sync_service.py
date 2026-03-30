@@ -28,15 +28,22 @@ logger = logging.getLogger(__name__)
 
 API_KEY = os.getenv('PARSEHUB_API_KEY')
 BASE_URL = 'https://www.parsehub.com/api/v2'
-SYNC_INTERVAL = int(os.getenv('AUTO_SYNC_INTERVAL', '5'))  # Default 5 minutes
+SYNC_INTERVAL = int(os.getenv('AUTO_SYNC_INTERVAL', '5'))         # Project-sync interval (minutes)
+DATA_FETCH_INTERVAL = int(os.getenv('DATA_FETCH_INTERVAL', '5'))  # Data-fetch interval (minutes)
 
 
 class AutoSyncService:
     """
-    Automatically syncs ParseHub data to database:
-    - Project details (title, main_site, last_run info)
-    - Run statuses (running/completed/cancelled)
-    - Latest run details for each project
+    Two independent background loops:
+
+    Thread A — _sync_loop (every AUTO_SYNC_INTERVAL minutes)
+        Syncs project metadata + run statuses from ParseHub API.
+        Fast: no CSV downloads.
+
+    Thread B — _data_fetch_loop (every DATA_FETCH_INTERVAL minutes)
+        Finds completed runs whose CSV data is not yet in Snowflake,
+        downloads the CSV, and stores it.  Uses its own Snowflake
+        connection so it never interferes with Thread A.
     """
 
     def __init__(self, max_workers: int = 5):
@@ -44,29 +51,80 @@ class AutoSyncService:
         self.api_key = API_KEY
         self.base_url = BASE_URL
         self.sync_interval = SYNC_INTERVAL
-        self.max_workers = max_workers  # Number of parallel threads
+        self.data_fetch_interval = DATA_FETCH_INTERVAL
+        self.max_workers = max_workers
         self.running = False
-        self.thread = None
+        self.thread = None        # Thread A: project sync
+        self.data_thread = None   # Thread B: data fetch
         self.stop_event = Event()
 
         if not self.api_key:
             raise Exception("PARSEHUB_API_KEY not configured in .env")
 
+    def _get_with_retry(
+        self,
+        url: str,
+        *,
+        params: Optional[Dict] = None,
+        timeout: int = 120,
+        max_retries: int = 4,
+        backoff_sec: float = 2.0,
+    ) -> Optional[requests.Response]:
+        """GET with retries for ParseHub timeouts and transient HTTP errors."""
+        merged: Dict = {'api_key': self.api_key}
+        if params:
+            merged.update(params)
+        retry_status = (429, 500, 502, 503, 504)
+        for attempt in range(max_retries):
+            try:
+                resp = requests.get(url, params=merged, timeout=timeout)
+                if resp.status_code in retry_status and attempt < max_retries - 1:
+                    logger.warning(
+                        "ParseHub GET %s returned %s (attempt %s/%s), retrying...",
+                        url[:96],
+                        resp.status_code,
+                        attempt + 1,
+                        max_retries,
+                    )
+                    time.sleep(backoff_sec * (attempt + 1))
+                    continue
+                return resp
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                logger.warning(
+                    "ParseHub GET %s: %s (attempt %s/%s)",
+                    url[:96],
+                    e,
+                    attempt + 1,
+                    max_retries,
+                )
+                if attempt < max_retries - 1:
+                    time.sleep(backoff_sec * (attempt + 1))
+                else:
+                    logger.error("ParseHub GET failed after %s attempts: %s", max_retries, url[:96])
+                    return None
+        return None
+
     def start(self):
-        """Start the auto-sync service in background thread"""
+        """Start both background threads."""
         if self.running:
             logger.warning("Auto-sync service already running")
             return
 
         self.running = True
         self.stop_event.clear()
-        self.thread = Thread(target=self._sync_loop, daemon=True)
+
+        # Thread A: project + run metadata sync
+        self.thread = Thread(target=self._sync_loop, name="project-sync", daemon=True)
         self.thread.start()
-        logger.info(
-            f"[OK] Auto-Sync Service started (interval: {self.sync_interval} minutes)")
+        logger.info(f"[OK] Project-sync thread started (every {self.sync_interval} min)")
+
+        # Thread B: CSV data fetch — independent timer, own DB connection
+        self.data_thread = Thread(target=self._data_fetch_loop, name="data-fetch", daemon=True)
+        self.data_thread.start()
+        logger.info(f"[OK] Data-fetch thread started (every {self.data_fetch_interval} min)")
 
     def stop(self):
-        """Stop the auto-sync service"""
+        """Stop both background threads."""
         if not self.running:
             return
 
@@ -74,6 +132,8 @@ class AutoSyncService:
         self.stop_event.set()
         if self.thread:
             self.thread.join(timeout=5)
+        if self.data_thread:
+            self.data_thread.join(timeout=5)
         logger.info("[OK] Auto-Sync Service stopped")
 
     def _sync_loop(self):
@@ -108,6 +168,48 @@ class AutoSyncService:
 
             # Wait for next interval or stop event
             self.stop_event.wait(timeout=self.sync_interval * 60)
+
+    def _data_fetch_loop(self):
+        """
+        Thread B — runs independently of the project-sync loop.
+
+        Every DATA_FETCH_INTERVAL minutes it:
+          1. Opens its own Snowflake connection (never shares with Thread A).
+          2. Queries for completed runs that have no CSV data yet.
+          3. Downloads the CSV from ParseHub and stores it.
+          4. Disconnects.
+        """
+        # Own ParseHubDatabase instance → own thread-local Snowflake connection.
+        db = ParseHubDatabase()
+        logger.info("[data-fetch] Thread started — first run in 30 s to let project-sync settle.")
+        # Small initial delay so project-sync has time to populate runs first.
+        self.stop_event.wait(timeout=30)
+
+        while self.running and not self.stop_event.is_set():
+            try:
+                logger.info(
+                    f"\n[data-fetch] [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                    "Checking for completed runs to fetch..."
+                )
+                results: Dict = {}
+                self._fetch_completed_runs_data(db, results)
+                stored = results.get('runs_data_stored', 0)
+                logger.info(f"[data-fetch] Done — stored data for {stored} run(s).")
+            except Exception as exc:
+                logger.error(f"[data-fetch] Unexpected error: {exc}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                # Always close the connection after each cycle so Snowflake
+                # doesn't hold an idle session for the full interval.
+                try:
+                    db.disconnect()
+                except Exception:
+                    pass
+
+            next_run = datetime.now() + timedelta(minutes=self.data_fetch_interval)
+            logger.info(f"[data-fetch] Next run: {next_run.strftime('%Y-%m-%d %H:%M:%S')}")
+            self.stop_event.wait(timeout=self.data_fetch_interval * 60)
 
     def sync_all(self):
         """
@@ -184,8 +286,7 @@ class AutoSyncService:
             logger.info("\n3. Updating active runs...")
             self.update_active_runs(results)
 
-            # 4. Fetch and store scraped data for completed runs
-            self.sync_completed_runs_data(results)
+            # NOTE: CSV data fetching is handled by the independent _data_fetch_loop thread.
 
             return results
 
@@ -203,11 +304,15 @@ class AutoSyncService:
             limit = 20  # ParseHub returns 20 projects per page
 
             while True:
-                response = requests.get(
+                response = self._get_with_retry(
                     f"{self.base_url}/projects",
-                    params={'api_key': self.api_key, 'offset': offset},
-                    timeout=10
+                    params={'offset': offset},
+                    timeout=90,
+                    max_retries=4,
                 )
+                if response is None:
+                    logger.error("ParseHub projects list: no response after retries")
+                    break
 
                 if response.status_code != 200:
                     logger.error(f"API error: {response.status_code}")
@@ -482,11 +587,14 @@ class AutoSyncService:
     def fetch_run_details(self, project_token: str, run_token: str) -> Optional[Dict]:
         """Fetch run details from ParseHub API"""
         try:
-            response = requests.get(
+            response = self._get_with_retry(
                 f"{self.base_url}/projects/{project_token}/run/{run_token}",
-                params={'api_key': self.api_key},
-                timeout=10
+                params={},
+                timeout=90,
+                max_retries=4,
             )
+            if response is None:
+                return None
 
             if response.status_code == 200:
                 return response.json()
@@ -510,13 +618,18 @@ class AutoSyncService:
         try:
             logger.info(f"   [DATA] Fetching data for run {run_token[:8]}...")
             
-            # Fetch data in CSV format
-            response = requests.get(
+            # Fetch data in CSV format (large payloads: long timeout + retries)
+            response = self._get_with_retry(
                 f"{self.base_url}/runs/{run_token}/data",
-                params={'api_key': self.api_key, 'format': 'csv'},
-                timeout=60
+                params={'format': 'csv'},
+                timeout=240,
+                max_retries=5,
+                backoff_sec=3.0,
             )
-            
+            if response is None:
+                logger.error(f"   [DATA] No response from ParseHub data endpoint after retries")
+                return False
+
             if response.status_code != 200:
                 logger.error(f"   [DATA] Failed to fetch data: HTTP {response.status_code}")
                 return False
@@ -627,88 +740,112 @@ class AutoSyncService:
             logger.error(f"Error parsing CSV: {e}")
             return records
 
-    def sync_completed_runs_data(self, results: Dict):
+    def _fetch_completed_runs_data(self, db: 'ParseHubDatabase', results: Dict):
         """
-        Fetch and store actual scraped data for completed runs
-        This is called during sync to ensure data is stored in Snowflake
+        Find completed runs whose CSV data is not yet stored, download it from
+        ParseHub, and persist it to Snowflake.
+
+        Uses the supplied *db* instance (Thread B's own connection) so it never
+        touches the connection belonging to the project-sync thread.
         """
-        try:
-            logger.info("\n4. Fetching and storing scraped data for completed runs...")
-            
-            conn = self.db.connect()
-            cursor = self.db.cursor()
-            
-            # Find completed runs that don't have data stored yet
-            # Check by looking at runs with status 'complete' in the last 24 hours
-            since = datetime.now() - timedelta(hours=24)
-            
-            cursor.execute('''
-                SELECT r.id, r.run_token, r.project_token, p.title
-                FROM runs r
-                JOIN projects p ON r.project_token = p.token
-                WHERE r.status = 'complete'
-                AND r.end_time >= %s
-                ORDER BY r.end_time DESC
-                LIMIT 10
-            ''', (since.isoformat(),))
-            
-            runs = cursor.fetchall()
-            
-            if not runs:
-                logger.info("   No recent completed runs to process")
-                return
-            
-            logger.info(f"   Found {len(runs)} completed runs to check")
-            
-            # Track results
-            stored_count = 0
-            
-            for run in runs:
-                # Handle both dict and tuple formats
-                if isinstance(run, dict):
-                    run_id = run.get('id')
-                    run_token = run.get('run_token')
-                    project_token = run.get('project_token')
-                    project_title = run.get('title', '')
-                else:
-                    run_id = run[0]
-                    run_token = run[1]
-                    project_token = run[2]
-                    project_title = run[3] if len(run) > 3 else ''
-                
-                # Check if data already exists for this run
-                cursor.execute('''
-                    SELECT COUNT(*) as count FROM analytics_cache
-                    WHERE run_token = %s
-                ''', (run_token,))
-                
+        since = datetime.now() - timedelta(hours=24)
+
+        # --- 1. Load the list of candidate runs (fresh connection) ---
+        conn = db.connect()
+        cursor = db.cursor()
+        cursor.execute('''
+            SELECT r.id, r.run_token, p.token AS project_token, p.title
+            FROM runs r
+            JOIN projects p ON r.project_id = p.id
+            WHERE LOWER(TRIM(r.status)) IN ('complete', 'completed')
+            AND COALESCE(r.end_time, r.updated_at) >= %s
+            ORDER BY COALESCE(r.end_time, r.updated_at) DESC
+            LIMIT 10
+        ''', (since.isoformat(),))
+        runs = cursor.fetchall()
+        # Close immediately — store_analytics_data will reopen when it needs to
+        db.disconnect()
+
+        if not runs:
+            logger.info("[data-fetch]   No recent completed runs to process")
+            results['runs_data_stored'] = 0
+            return
+
+        logger.info(f"[data-fetch]   Found {len(runs)} completed run(s) to check")
+        stored_count = 0
+
+        for run in runs:
+            # Normalise Snowflake uppercase keys
+            if isinstance(run, dict):
+                rl = {k.lower(): v for k, v in run.items()}
+                run_token = rl.get('run_token')
+                project_token = rl.get('project_token')
+                project_title = rl.get('title', '')
+            else:
+                run_token = run[1]
+                project_token = run[2]
+                project_title = run[3] if len(run) > 3 else ''
+
+            # --- 2. Skip if data already stored (fresh connection per check) ---
+            try:
+                conn = db.connect()
+                cursor = db.cursor()
+                cursor.execute(
+                    'SELECT COUNT(*) as count FROM analytics_cache WHERE run_token = %s',
+                    (run_token,),
+                )
                 existing = cursor.fetchone()
+                existing_count = (
+                    existing.get('count', 0) if isinstance(existing, dict)
+                    else (existing[0] if existing else 0)
+                )
+                db.disconnect()
+            except Exception as chk_err:
+                logger.warning(f"[data-fetch]   Could not check cache for {run_token[:8]}: {chk_err}")
+                db.disconnect()
                 existing_count = 0
-                if isinstance(existing, dict):
-                    existing_count = existing.get('count', 0)
-                elif existing:
-                    existing_count = existing[0]
-                
-                if existing_count > 0:
-                    logger.info(f"   [SKIP] Data already stored for run {run_token[:8]}...")
-                    continue
-                
-                # Fetch and store data
-                logger.info(f"\n   [FETCH] {project_title} - Run {run_token[:8]}...")
-                success = self.fetch_and_store_run_data(project_token, run_token, project_title)
-                
-                if success:
-                    stored_count += 1
-                
-                time.sleep(0.5)  # Rate limiting
-            
-            logger.info(f"\n   [SUMMARY] Stored data for {stored_count} runs")
-            results['runs_data_stored'] = stored_count
-            
-        except Exception as e:
-            logger.error(f"Error syncing completed runs data: {e}")
-            import traceback
-            traceback.print_exc()
+
+            if existing_count > 0:
+                logger.info(f"[data-fetch]   [SKIP] Already stored: {run_token[:8]}...")
+                continue
+
+            # --- 3. Download CSV + store to Snowflake ---
+            logger.info(f"[data-fetch]   [FETCH] {project_title} — run {run_token[:8]}...")
+            success = self._fetch_and_store_with_db(db, project_token, run_token, project_title)
+            if success:
+                stored_count += 1
+
+            time.sleep(0.5)  # gentle rate-limiting between runs
+
+        logger.info(f"[data-fetch]   [SUMMARY] Stored data for {stored_count} run(s)")
+        results['runs_data_stored'] = stored_count
+
+    def _fetch_and_store_with_db(
+        self,
+        db: 'ParseHubDatabase',
+        project_token: str,
+        run_token: str,
+        project_title: str = "",
+    ) -> bool:
+        """
+        Thin wrapper around fetch_and_store_run_data that temporarily swaps
+        self.db to the caller-supplied *db* instance so that store_analytics_data
+        writes via Thread B's own Snowflake connection.
+        """
+        original_db = self.db
+        self.db = db
+        try:
+            return self.fetch_and_store_run_data(project_token, run_token, project_title)
+        finally:
+            self.db = original_db
+
+    # ------------------------------------------------------------------
+    # Legacy name kept for any external callers (e.g. manual_sync path).
+    # Delegates to _fetch_completed_runs_data using the shared self.db.
+    # ------------------------------------------------------------------
+    def sync_completed_runs_data(self, results: Dict):
+        """Backward-compatible wrapper — use _fetch_completed_runs_data directly."""
+        self._fetch_completed_runs_data(self.db, results)
 
 
 # Global instance

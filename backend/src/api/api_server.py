@@ -5,10 +5,17 @@ Exposes REST endpoints for the Next.js frontend to control and monitor real-time
 
 from pathlib import Path
 import sys
+from dotenv import load_dotenv
+
+# Backend root: load .env and/or env before any code that reads os.environ
+_backend_dir = Path(__file__).parent.parent.parent  # backend/
+load_dotenv(_backend_dir / '.env')
+load_dotenv(_backend_dir / 'env')
+
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
-from dotenv import load_dotenv
 import os
+import threading
 import logging
 import traceback
 import uuid
@@ -17,12 +24,8 @@ import json
 from datetime import datetime
 import requests
 
-# Load environment variables (.env file in the same directory)
-load_dotenv()
-
 # Add the backend directory to sys.path so all local modules are importable
 # This allows imports from the new package structure (src.models, src.services, etc.)
-_backend_dir = Path(__file__).parent.parent.parent  # backend/
 if str(_backend_dir) not in sys.path:
     sys.path.insert(0, str(_backend_dir))
 
@@ -39,6 +42,12 @@ from src.services.auto_sync_service import start_auto_sync_service, stop_auto_sy
 from src.services.scheduled_run_service import start_scheduled_run_service, stop_scheduled_run_service, get_scheduled_run_service
 from src.services.auto_complete_service import AutoCompleteService, start_auto_complete_service, register_run_for_completion
 from src.api.resume_routes import resume_bp
+from src.services.scraped_records_ingest_service import (
+    start_scraped_records_ingest_worker,
+    enqueue_scraped_records_ingest,
+    get_scraped_records_ingest_stats,
+)
+import queue as queue_stdlib
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -278,6 +287,17 @@ def _start_background_services():
     """Start background scheduler services (called inside _initialize_services)."""
     global _auto_complete_service
     try:
+        if os.getenv('SKIP_BACKGROUND_SERVICES', '').strip().lower() in (
+            '1',
+            'true',
+            'yes',
+        ):
+            logger.info(
+                '[bg] SKIP_BACKGROUND_SERVICES is set — skipping incremental sync, '
+                'auto-sync, schedulers, auto-complete, and ingest worker (for tests/CI).'
+            )
+            return
+
         check_interval = int(os.getenv('INCREMENTAL_SCRAPING_INTERVAL', '30'))
         sync_interval  = int(os.getenv('AUTO_SYNC_INTERVAL', '5'))
         logger.info(
@@ -305,7 +325,12 @@ def _start_background_services():
             except Exception as ace:
                 logger.error(f'[bg] Auto-complete service failed to start: {ace}')
 
-            logger.info('[bg] Background services started.')
+        try:
+            start_scraped_records_ingest_worker()
+        except Exception as ing_exc:
+            logger.error(f'[bg] Scraped records ingest worker failed to start: {ing_exc}')
+
+        logger.info('[bg] Background services started.')
     except Exception as exc:
         logger.error(f'[bg] Failed to start background services: {exc}')
 
@@ -326,6 +351,104 @@ def validate_api_key(request_obj):
         return True
     return False
 
+
+@app.route('/api/scraped-records/ingest', methods=['POST'])
+def scraped_records_ingest():
+    """
+    Queue async batch insert into scraped_records (same columns as resume scraper).
+
+    JSON body:
+      - run_token (required)
+      - source_page (required, int >= 1)
+      - records (required, non-empty array of objects)
+      - project_id OR project_token (one required) to resolve Snowflake project id
+      - session_id (optional)
+      - mirror_scraped_data (optional, default true)
+
+    Returns 202 with job_id. Requires x-api-key or Bearer BACKEND_API_KEY.
+    """
+    if not validate_api_key(request):
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': 'JSON body required'}), 400
+
+    _rt = data.get('run_token')
+    if _rt is None:
+        return jsonify({'error': 'run_token is required'}), 400
+    run_token = str(_rt).strip()
+    if not run_token:
+        return jsonify({'error': 'run_token is required'}), 400
+
+    try:
+        source_page = int(data.get('source_page'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'source_page must be an integer >= 1'}), 400
+    if source_page < 1:
+        return jsonify({'error': 'source_page must be an integer >= 1'}), 400
+
+    records = data.get('records')
+    if not isinstance(records, list) or len(records) == 0:
+        return jsonify({'error': 'records must be a non-empty array'}), 400
+    if not all(isinstance(r, dict) for r in records):
+        return jsonify({'error': 'each record in records must be an object'}), 400
+
+    project_id = data.get('project_id')
+    project_token = data.get('project_token')
+    if project_id is not None:
+        try:
+            project_id = int(project_id)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'project_id must be a positive integer'}), 400
+        if project_id <= 0:
+            return jsonify({'error': 'project_id must be a positive integer'}), 400
+    elif project_token:
+        pid = g.db.get_project_id_by_token(str(project_token).strip())
+        if pid is None:
+            return jsonify({'error': f'Unknown project_token: {project_token}'}), 400
+        project_id = pid
+    else:
+        return jsonify({'error': 'Provide project_id or project_token'}), 400
+
+    session_id = data.get('session_id')
+    if session_id is not None:
+        try:
+            session_id = int(session_id)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'session_id must be an integer or null'}), 400
+
+    mirror = data.get('mirror_scraped_data', True)
+    if not isinstance(mirror, bool):
+        return jsonify({'error': 'mirror_scraped_data must be a boolean'}), 400
+
+    payload = {
+        'project_id': project_id,
+        'run_token': run_token,
+        'source_page': source_page,
+        'records': records,
+        'session_id': session_id,
+        'mirror_scraped_data': mirror,
+    }
+    try:
+        job_id = enqueue_scraped_records_ingest(payload)
+    except queue_stdlib.Full:
+        return jsonify({'error': 'Ingest queue is full; retry later'}), 503
+
+    return jsonify({
+        'status': 'accepted',
+        'job_id': job_id,
+        'message': 'Batch queued for scraped_records insert',
+    }), 202
+
+
+@app.route('/api/scraped-records/ingest/status', methods=['GET'])
+def scraped_records_ingest_status():
+    """Queue depth and ingest counters (same API key as ingest)."""
+    if not validate_api_key(request):
+        return jsonify({'error': 'Unauthorized'}), 401
+    return jsonify(get_scraped_records_ingest_stats()), 200
+
 # ========== MONITORING ENDPOINTS ==========
 
 
@@ -342,13 +465,32 @@ def start_monitoring():
     }
     """
     try:
-        data = request.get_json()
+        data = request.get_json() or {}
         run_token = data.get('run_token')
         pages = data.get('pages', 1)
         project_id = data.get('project_id')
+        project_token = data.get('project_token')
 
         if not run_token:
             return jsonify({'error': 'Missing required field: run_token'}), 400
+
+        if project_id is not None:
+            try:
+                project_id = int(project_id)
+            except (TypeError, ValueError):
+                project_id = None
+
+        # Prefer explicit project_token from the client (Next.js always sends this); required on
+        # Snowflake where runs schema may not match legacy SELECT project_id FROM runs...
+        if project_id is None and project_token:
+            pid = g.db.get_project_id_by_token(project_token)
+            if pid is not None:
+                project_id = int(pid)
+                logger.info(
+                    '[MONITOR] Resolved project_id=%s from project_token=%s...',
+                    project_id,
+                    project_token[:8],
+                )
 
         # If project_id not provided, infer from run token
         if not project_id:
@@ -389,14 +531,29 @@ def start_monitoring():
         if not session_id:
             return jsonify({'error': 'Failed to create monitoring session'}), 500
 
-        # Start real-time monitoring in background
-        # This will run the monitoring loop in the monitoring service
-        try:
-            _monitoring_service.monitor_run_realtime(
-                project_id, run_token, pages)
-        except Exception as e:
-            logger.error(f'Error starting real-time monitoring: {e}')
-            # Still return success since session was created, monitoring will retry
+        # Start real-time monitoring loop (can block for a long time; see daemon thread below).
+        # SKIP_MONITOR_REALTIME=1 skips the loop (tests/CI, or when only persisting the session row).
+        skip_rt = os.getenv('SKIP_MONITOR_REALTIME', '').strip().lower() in (
+            '1', 'true', 'yes',
+        )
+        if _monitoring_service and not skip_rt:
+            def _monitor_worker():
+                try:
+                    _monitoring_service.monitor_run_realtime(
+                        project_id, run_token, pages)
+                except Exception as e:
+                    logger.error(f'Error starting real-time monitoring: {e}')
+
+            threading.Thread(
+                target=_monitor_worker,
+                daemon=True,
+                name='monitor_run_realtime',
+            ).start()
+        elif skip_rt:
+            logger.info(
+                '[MONITOR] SKIP_MONITOR_REALTIME is set — session created, '
+                'not starting monitor_run_realtime loop',
+            )
 
         return jsonify({
             'session_id': session_id,

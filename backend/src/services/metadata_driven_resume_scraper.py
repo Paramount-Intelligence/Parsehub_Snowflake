@@ -40,10 +40,121 @@ if str(root_dir) not in sys.path:
 
 from src.models.database import ParseHubDatabase
 from src.services.notification_service import get_notification_service
+from src.services.pagination_service import PaginationService
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+
+def _coerce_int(val, default: int = 0) -> int:
+    """Snowflake/drivers may return numbers as str; normalize for comparisons and arithmetic."""
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return int(val)
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(val)
+    try:
+        s = str(val).strip()
+        if not s:
+            return default
+        return int(float(s))
+    except (ValueError, TypeError, OverflowError):
+        return default
+
+
+# Lazy: PaginationService only wraps regex helpers (no DB connect on extract_page_number)
+_pagination_url_pages = PaginationService()
+
+
+def _parse_record_data_blob(raw) -> Optional[dict]:
+    """analytics_records.record_data may be JSON text or a dict (e.g. VARIANT)."""
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+        try:
+            obj = json.loads(s)
+            return obj if isinstance(obj, dict) else None
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+    return None
+
+
+def _max_page_from_record_dict(record: dict, depth: int = 0) -> int:
+    """
+    Best-effort page number from one analytics / ParseHub row.
+    Checks common keys and URL fields, then shallow-recurses into nested dicts/lists.
+    """
+    if not isinstance(record, dict) or depth > 6:
+        return 0
+
+    key_candidates = (
+        'source_page',
+        'page_number',
+        'page',
+        'Page',
+        'current_page',
+        'listing_page',
+        'scraped_page',
+    )
+    best = 0
+    for k in key_candidates:
+        if k in record:
+            best = max(best, _coerce_int(record.get(k), 0))
+
+    for uk in ('url', 'product_url', 'link', 'page_url', 'listing_url', 'href'):
+        u = record.get(uk)
+        if isinstance(u, str) and u.strip():
+            best = max(best, _pagination_url_pages.extract_page_number(u))
+
+    for v in record.values():
+        if isinstance(v, dict):
+            best = max(best, _max_page_from_record_dict(v, depth + 1))
+        elif isinstance(v, list) and depth < 4:
+            for item in v:
+                if isinstance(item, dict):
+                    best = max(best, _max_page_from_record_dict(item, depth + 1))
+    return best
+
+
+def _analytics_checkpoint_for_token(cursor, project_token: str) -> Tuple[int, int]:
+    """
+    Max page and row count from analytics_records for this ParseHub project token.
+    Rows are the same source the /api/analytics UI uses (record_data JSON).
+    """
+    if not project_token:
+        return 0, 0
+    try:
+        cursor.execute(
+            '''
+            SELECT record_data
+            FROM analytics_records
+            WHERE project_token = %s
+            ''',
+            (project_token,),
+        )
+        rows = cursor.fetchall() or []
+    except Exception as ex:
+        logger.warning('[CHECKPOINT] analytics_records query failed (ignored): %s', ex)
+        return 0, 0
+
+    max_page = 0
+    n = 0
+    for row in rows:
+        n += 1
+        raw = row.get('record_data') if isinstance(row, dict) else (row[0] if row else None)
+        parsed = _parse_record_data_blob(raw)
+        if parsed:
+            max_page = max(max_page, _max_page_from_record_dict(parsed))
+    return max_page, n
 
 
 # ============= HELPER FUNCTIONS =============
@@ -91,187 +202,161 @@ class MetadataDrivenResumeScraper:
     
     def get_project_url(self, project_id: int) -> Optional[str]:
         """
-        Fetch project URL (main_site) from projects table
-        
-        SOURCE OF TRUTH for the starting URL.
-        Fallback to metadata.WEBSITE_URL if projects.main_site is NULL.
-        
-        Returns:
-            project_url string or None if not found
+        Fetch listing URL for pagination: projects.main_site first, then metadata.website_url / last_known_url.
+
+        Always use self.db.disconnect() (not raw conn.close()) so thread-local Snowflake state stays valid.
         """
         try:
-            logger.info(f"[PROJECT_URL] Fetching main_site for project_id={project_id}")
-            conn = self.db.connect()
+            logger.info(f"[PROJECT_URL] Fetching URL for project_id={project_id}")
+            self.db.connect()
             cursor = self.db.cursor()
-            
-            # Step 1: Try projects table first
-            cursor.execute('''
+
+            cursor.execute(
+                '''
                 SELECT main_site
                 FROM projects
                 WHERE id = %s
                 LIMIT 1
-            ''', (project_id,))
-            
+                ''',
+                (project_id,),
+            )
             result = cursor.fetchone()
             log_value("project_url_from_projects", result)
-            
+
             if result:
-                # Extract URL from result (handle both dict and tuple)
                 if isinstance(result, dict):
                     project_url = result.get('main_site')
                 else:
                     project_url = result[0] if len(result) > 0 else None
-                
                 project_url = safe_str(project_url) if project_url else None
-                
                 if project_url:
-                    logger.info(f"[PROJECT_URL] ✓ Found from projects.main_site: {project_url}")
-                    conn.close()
+                    logger.info(f"[PROJECT_URL] ✓ projects.main_site: {project_url}")
                     return project_url
-            
-            # Step 2: Fallback to metadata.WEBSITE_URL if projects.main_site is NULL
-            logger.info(f"[PROJECT_URL] projects.main_site is NULL, trying metadata.WEBSITE_URL...")
-            cursor.execute('''
-                SELECT WEBSITE_URL
+
+            logger.info("[PROJECT_URL] main_site empty; trying metadata website_url / last_known_url...")
+            cursor.execute(
+                '''
+                SELECT website_url, last_known_url
                 FROM metadata
-                WHERE PROJECT_ID = %s
+                WHERE project_id = %s
                 LIMIT 1
-            ''', (project_id,))
-            
+                ''',
+                (project_id,),
+            )
             metadata_result = cursor.fetchone()
             log_value("project_url_from_metadata", metadata_result)
-            
+
             if metadata_result:
-                # Extract URL from result (handle both dict and tuple)
                 if isinstance(metadata_result, dict):
-                    project_url = metadata_result.get('WEBSITE_URL') or metadata_result.get('website_url')
+                    wu = metadata_result.get('website_url') or metadata_result.get('WEBSITE_URL')
+                    lk = metadata_result.get('last_known_url') or metadata_result.get('LAST_KNOWN_URL')
                 else:
-                    project_url = metadata_result[0] if len(metadata_result) > 0 else None
-                
-                project_url = safe_str(project_url) if project_url else None
-                
-                if project_url:
-                    logger.info(f"[PROJECT_URL] ✓ Using fallback metadata.WEBSITE_URL: {project_url}")
-                    conn.close()
-                    return project_url
-            
-            conn.close()
-            logger.error(f"[PROJECT_URL] ✗ No URL found in projects.main_site or metadata.WEBSITE_URL for project_id={project_id}")
+                    wu = metadata_result[0] if len(metadata_result) > 0 else None
+                    lk = metadata_result[1] if len(metadata_result) > 1 else None
+                for cand in (wu, lk):
+                    u = safe_str(cand) if cand else None
+                    if u:
+                        logger.info(f"[PROJECT_URL] ✓ metadata URL: {u}")
+                        return u
+
+            logger.error(
+                f"[PROJECT_URL] ✗ No URL for project_id={project_id} (projects.main_site + metadata)"
+            )
             return None
-        
+
         except Exception as e:
-            logger.error(f"[PROJECT_URL] Error fetching project URL: {e}")
-            logger.error(f"[PROJECT_URL] Traceback: {traceback.format_exc()}")
+            logger.error(f"[PROJECT_URL] Error: {e}")
+            logger.error(traceback.format_exc())
             return None
+        finally:
+            try:
+                self.db.disconnect()
+            except Exception:
+                pass
     
     # ===== METADATA OPERATIONS =====
     
     def get_project_metadata(self, project_id: int) -> Optional[Dict]:
         """
-        Get project metadata from database
-        
-        Normalizes all Snowflake uppercase keys to lowercase for consistent access.
-        Snowflake returns columns like: ID, PROJECT_NAME, LAST_KNOWN_URL, TOTAL_PAGES, etc.
-        This function normalizes them to: id, project_name, last_known_url, total_pages, etc.
-        
-        Also ensures all string values are properly handled (None → '')
-        
-        Returns:
-            {
-                'project_id': int,
-                'project_name': str,
-                'website_url': str (original URL for first run),
-                'total_pages': int,
-                'total_products': int,
-                'project_token': str
-            }
+        Load metadata for projects.id = project_id (not metadata.id).
+
+        Exposes website_url (prefer WEBSITE_URL column, else LAST_KNOWN_URL) and coerced ints.
         """
         try:
-            logger.info(f"[METADATA] Fetching metadata for project {project_id}")
-            conn = self.db.connect()
+            logger.info(f"[METADATA] Fetching metadata for projects.id={project_id}")
+            self.db.connect()
             cursor = self.db.cursor()
-            
-            cursor.execute('''
-                SELECT id, project_name, last_known_url, 
-                       total_pages, total_products, project_token
+
+            cursor.execute(
+                '''
+                SELECT *
                 FROM metadata
-                WHERE project_id = %s OR id = %s
+                WHERE project_id = %s
                 LIMIT 1
-            ''', (project_id, project_id))
-            
+                ''',
+                (project_id,),
+            )
             result = cursor.fetchone()
-            conn.close()
-            
             log_value("DATABASE_RESULT", result)
-            
+
             if not result:
-                logger.warning(f"[METADATA] No metadata found for project {project_id}")
+                logger.warning(f"[METADATA] No metadata row for project_id={project_id}")
                 return None
-            
-            # Normalize keys to lowercase (Snowflake returns UPPERCASE)
-            normalized = {}
-            
-            # Convert dict-like result to dict if needed
+
             if isinstance(result, dict):
-                logger.debug(f"[METADATA] Result is dict with keys: {list(result.keys())}")
-                for key, value in result.items():
-                    # Normalize key to lowercase
-                    normalized_key = key.lower() if isinstance(key, str) else key
-                    log_value(f"METADATA_FIELD[{normalized_key}]", value)
-                    normalized[normalized_key] = value
-            else:
-                logger.debug(f"[METADATA] Result is tuple/list with {len(result)} elements")
-                # Handle tuple result from some database drivers
-                # Mapping: [0]=id, [1]=project_name, [2]=last_known_url, [3]=total_pages, [4]=total_products, [5]=project_token
-                log_value("METADATA[id]", result[0] if result else None)
-                log_value("METADATA[project_name]", result[1] if len(result) > 1 else None)
-                log_value("METADATA[last_known_url]", result[2] if len(result) > 2 else None)
-                log_value("METADATA[total_pages]", result[3] if len(result) > 3 else None)
-                log_value("METADATA[total_products]", result[4] if len(result) > 4 else None)
-                log_value("METADATA[project_token]", result[5] if len(result) > 5 else None)
-                
                 normalized = {
-                    'id': result[0] if result else project_id,
-                    'project_name': result[1] if len(result) > 1 else 'Unknown',
-                    'last_known_url': result[2] if len(result) > 2 else '',
-                    'total_pages': result[3] if len(result) > 3 else 0,
-                    'total_products': result[4] if len(result) > 4 else 0,
-                    'project_token': result[5] if len(result) > 5 else ''
+                    (k.lower() if isinstance(k, str) else k): v
+                    for k, v in result.items()
                 }
-            
-            # Extract with lowercase keys, safely handle all string values
-            website_url_raw = normalized.get('last_known_url', '')
-            log_value("website_url_raw", website_url_raw)
-            website_url_safe = safe_str(website_url_raw)
-            log_value("website_url_safe", website_url_safe)
-            
+            else:
+                logger.warning("[METADATA] Unexpected non-dict row from SnowflakeCursorShim")
+                return None
+
+            pid_row = _coerce_int(normalized.get('project_id'), project_id)
+            meta_id = _coerce_int(normalized.get('id'), 0)
+            wu = safe_str(normalized.get('website_url', ''))
+            lk = safe_str(normalized.get('last_known_url', ''))
+            listing_url = wu or lk
+
             final_result = {
-                'project_id': normalized.get('id', project_id),
+                'project_id': pid_row or project_id,
+                'metadata_row_id': meta_id,
                 'project_name': safe_str(normalized.get('project_name', 'Unknown')) or 'Unknown',
-                'website_url': website_url_safe,  # Original URL for fresh projects
-                'total_pages': normalized.get('total_pages', 0) or 0,
-                'total_products': normalized.get('total_products', 0) or 0,
-                'project_token': safe_str(normalized.get('project_token', ''))
+                'website_url': listing_url,
+                'last_known_url': lk,
+                'total_pages': _coerce_int(normalized.get('total_pages'), 0),
+                'total_products': _coerce_int(normalized.get('total_products'), 0),
+                'project_token': safe_str(normalized.get('project_token', '')),
             }
-            
+
             logger.info(f"[METADATA] Final metadata: {final_result}")
             return final_result
-        
+
         except Exception as e:
             logger.error(f"[METADATA] Error reading metadata: {e}")
-            import traceback
-            logger.error(f"[METADATA] {traceback.format_exc()}")
+            logger.error(traceback.format_exc())
             return None
+        finally:
+            try:
+                self.db.disconnect()
+            except Exception:
+                pass
     
     # ===== CHECKPOINT MANAGEMENT =====
     
     def get_checkpoint(self, project_id: int) -> Dict:
         """
         Get current checkpoint (highest successfully scraped page)
-        
-        Uses MAX(source_page) from scraped_records to track progress
-        This is a reliable checkpoint representing the highest completed WEBSITE page
-        
+
+        Merges progress from:
+        1) scraped_records.MAX(source_page) — canonical when the resume pipeline persists here
+        2) metadata.current_page_scraped — updated when checkpoint is written from the scraper
+        3) analytics_records — same rows as /api/analytics; max page from each record_data JSON
+           (source_page, page_number, page, URLs with ?page=, etc.)
+
+        Without (3), runs that only populated analytics (e.g. legacy ingest) showed highest_page=0
+        and incorrectly restarted at page 1 instead of resuming.
+
         Returns:
             {
                 'highest_successful_page': int,
@@ -282,48 +367,110 @@ class MetadataDrivenResumeScraper:
         """
         try:
             logger.info(f"[CHECKPOINT] Fetching checkpoint for project {project_id}")
-            conn = self.db.connect()
+            self.db.connect()
             cursor = self.db.cursor()
-            
-            # Get highest source_page from successfully persisted records
-            cursor.execute('''
+
+            project_token = None
+            try:
+                cursor.execute(
+                    'SELECT token FROM projects WHERE id = %s LIMIT 1',
+                    (project_id,),
+                )
+                prow = cursor.fetchone()
+                if prow:
+                    if isinstance(prow, dict):
+                        project_token = safe_str(prow.get('token'))
+                    else:
+                        project_token = safe_str(prow[0]) if len(prow) > 0 else ''
+            except Exception as e:
+                logger.warning('[CHECKPOINT] Could not load projects.token: %s', e)
+
+            cursor.execute(
+                '''
                 SELECT MAX(source_page) as highest_page,
                        COUNT(*) as total_records
                 FROM scraped_records
                 WHERE project_id = %s
-            ''', (project_id,))
-            
+                ''',
+                (project_id,),
+            )
+
             result = cursor.fetchone()
             log_value("checkpoint_database_result", result)
-            conn.close()
-            
-            highest_page = 0
-            total_records = 0
-            
+
+            sr_highest = 0
+            sr_count = 0
+
             if result:
                 if isinstance(result, dict):
-                    highest_page = result.get('highest_page')
-                    total_records = result.get('total_records')
+                    sr_highest = result.get('highest_page')
+                    sr_count = result.get('total_records')
                 else:
-                    # Tuple/list result
-                    highest_page = result[0] if len(result) > 0 else None
-                    total_records = result[1] if len(result) > 1 else None
-            
-            log_value("checkpoint_highest_page_raw", highest_page)
-            log_value("checkpoint_total_records_raw", total_records)
-            
-            highest_page = highest_page or 0
-            total_records = total_records or 0
-            
-            logger.info(f"[CHECKPOINT] Project {project_id}: highest_page={highest_page}, records={total_records}")
-            
+                    sr_highest = result[0] if len(result) > 0 else None
+                    sr_count = result[1] if len(result) > 1 else None
+
+            log_value("checkpoint_highest_page_raw", sr_highest)
+            log_value("checkpoint_total_records_raw", sr_count)
+
+            sr_highest = _coerce_int(sr_highest, 0)
+            sr_count = _coerce_int(sr_count, 0)
+
+            meta_cur = 0
+            try:
+                cursor.execute(
+                    '''
+                    SELECT current_page_scraped
+                    FROM metadata
+                    WHERE project_id = %s
+                    LIMIT 1
+                    ''',
+                    (project_id,),
+                )
+                mrow = cursor.fetchone()
+                if mrow:
+                    if isinstance(mrow, dict):
+                        meta_cur = _coerce_int(mrow.get('current_page_scraped'), 0)
+                    else:
+                        meta_cur = _coerce_int(mrow[0] if len(mrow) > 0 else 0, 0)
+            except Exception as e:
+                logger.warning('[CHECKPOINT] metadata.current_page_scraped read failed: %s', e)
+
+            ar_highest, ar_count = _analytics_checkpoint_for_token(cursor, project_token or '')
+
+            highest_page = max(sr_highest, meta_cur, ar_highest)
+            total_records = max(sr_count, ar_count)
+
+            # If analytics has rows but no page/source_page in JSON, max page stays 0 even though
+            # a run already scraped listing page 1 (common for product-only rows). Assume page 1.
+            if highest_page == 0 and ar_count > 0:
+                logger.info(
+                    '[CHECKPOINT] analytics_records has %s rows but no page fields; '
+                    'assuming highest_successful_page=1',
+                    ar_count,
+                )
+                highest_page = 1
+
+            logger.info(
+                '[CHECKPOINT] Project %s: merged highest_page=%s '
+                '(scraped_records=%s, metadata.current_page_scraped=%s, analytics_records max=%s, '
+                'counts sr=%s ar=%s -> total_persisted_records=%s)',
+                project_id,
+                highest_page,
+                sr_highest,
+                meta_cur,
+                ar_highest,
+                sr_count,
+                ar_count,
+                total_records,
+            )
+
             return {
                 'highest_successful_page': highest_page,
                 'next_start_page': highest_page + 1,
                 'total_persisted_records': total_records,
-                'checkpoint_timestamp': datetime.now().isoformat()
+                'checkpoint_timestamp': datetime.now().isoformat(),
             }
-        
+
         except Exception as e:
             logger.error(f"[CHECKPOINT] Error reading checkpoint: {e}")
             logger.error(f"[CHECKPOINT] Traceback: {traceback.format_exc()}")
@@ -331,8 +478,13 @@ class MetadataDrivenResumeScraper:
                 'highest_successful_page': 0,
                 'next_start_page': 1,
                 'total_persisted_records': 0,
-                'checkpoint_timestamp': datetime.now().isoformat()
+                'checkpoint_timestamp': datetime.now().isoformat(),
             }
+        finally:
+            try:
+                self.db.disconnect()
+            except Exception:
+                pass
     
     def update_checkpoint(self, project_id: int, highest_successful_page: int) -> bool:
         """
@@ -343,27 +495,31 @@ class MetadataDrivenResumeScraper:
         try:
             conn = self.db.connect()
             cursor = self.db.cursor()
-            
-            cursor.execute('''
+
+            cursor.execute(
+                '''
                 UPDATE metadata
                 SET current_page_scraped = %s,
                     updated_date = %s
-                WHERE project_id = %s OR id = %s
-            ''', (highest_successful_page, datetime.now(), project_id, project_id))
-            
+                WHERE project_id = %s
+                ''',
+                (highest_successful_page, datetime.now(), project_id),
+            )
+
             conn.commit()
-            conn.close()
-            
-            logger.info(f"[CHECKPOINT] Updated project {project_id}: highest_page={highest_successful_page}")
+            logger.info(
+                f"[CHECKPOINT] Updated project {project_id}: highest_page={highest_successful_page}"
+            )
             return True
-        
+
         except Exception as e:
             logger.error(f"[CHECKPOINT] Error updating checkpoint: {e}")
-            try:
-                conn.close()
-            except:
-                pass
             return False
+        finally:
+            try:
+                self.db.disconnect()
+            except Exception:
+                pass
     
     # ===== URL GENERATION =====
     
@@ -901,11 +1057,16 @@ class MetadataDrivenResumeScraper:
         Returns:
             (success: bool, records_inserted: int, highest_page: int)
         """
+        conn = None
         try:
             logger.info(f"[PERSIST] Persisting {len(data)} records from page {source_page} for project {project_id}")
             
             if not data:
                 logger.warning(f"[PERSIST] No data to persist for project {project_id}")
+                try:
+                    self.db.disconnect()
+                except Exception:
+                    pass
                 return (True, 0, source_page)  # Success but nothing inserted
             
             conn = self.db.connect()
@@ -945,7 +1106,6 @@ class MetadataDrivenResumeScraper:
                     continue
             
             conn.commit()
-            conn.close()
             logger.info(f"[PERSIST] committed {inserted_count} rows to scraped_records")
 
             # Mirror rows into scraped_data (Snowflake) for reporting / exports
@@ -971,11 +1131,14 @@ class MetadataDrivenResumeScraper:
             try:
                 if conn:
                     conn.rollback()
-                    conn.close()
-            except:
+            except Exception:
                 pass
-            
             return (False, 0, 0)
+        finally:
+            try:
+                self.db.disconnect()
+            except Exception:
+                pass
     
     def compute_highest_successful_page(self, project_id: int) -> int:
         """
@@ -993,21 +1156,22 @@ class MetadataDrivenResumeScraper:
         Determine if project scraping is complete
         
         Completion Rule:
-        When max(source_page) from scraped_records >= total_pages from metadata, project is complete.
-        This ensures all pages have been scraped.
+        When merged highest_successful_page (see get_checkpoint) >= total_pages from metadata,
+        project is complete.
         
         Returns:
             (is_complete: bool, reason: str)
         """
         checkpoint = self.get_checkpoint(project_id)
-        highest_page = checkpoint['highest_successful_page']
-        total_pages = metadata.get('total_pages', 0)
-        total_products = metadata.get('total_products', 0)
-        
+        highest_page = _coerce_int(checkpoint['highest_successful_page'], 0)
+        total_pages = _coerce_int(metadata.get('total_pages'), 0)
+        total_products = _coerce_int(metadata.get('total_products'), 0)
+
         logger.info(f"\n[COMPLETE] Checking completion for project {project_id}")
         logger.info(f"[COMPLETE] Highest page scraped (max source_page): {highest_page}")
         logger.info(f"[COMPLETE] Total pages required: {total_pages}")
-        
+        logger.debug(f"[COMPLETE] total_products (metadata): {total_products}")
+
         # Primary check: all pages scraped
         # When highest_page >= total_pages, all required pages have been scraped
         if highest_page >= total_pages and total_pages > 0:
@@ -1032,27 +1196,29 @@ class MetadataDrivenResumeScraper:
         try:
             conn = self.db.connect()
             cursor = self.db.cursor()
-            
-            cursor.execute('''
+
+            cursor.execute(
+                '''
                 UPDATE metadata
                 SET status = 'complete',
                     updated_date = %s
-                WHERE project_id = %s OR id = %s
-            ''', (datetime.now(), project_id, project_id))
-            
+                WHERE project_id = %s
+                ''',
+                (datetime.now(), project_id),
+            )
+
             conn.commit()
-            conn.close()
-            
             logger.info(f"[COMPLETE] Marked project {project_id} as complete")
             return True
-        
+
         except Exception as e:
             logger.error(f"[COMPLETE] Error marking project complete: {e}")
-            try:
-                conn.close()
-            except:
-                pass
             return False
+        finally:
+            try:
+                self.db.disconnect()
+            except Exception:
+                pass
     
     # ===== FAILURE NOTIFICATIONS =====
     
@@ -1143,11 +1309,15 @@ class MetadataDrivenResumeScraper:
                     'error': error_msg
                 }
             
-            # Normalize all metadata keys to lowercase
+            # Normalize all metadata keys to lowercase and numeric fields
             metadata = metadata or {}
             metadata = {str(k).lower(): v for k, v in metadata.items()}
-            
-            logger.info(f"[METADATA] {metadata.get('project_name', 'Unknown')}: {metadata.get('total_pages', 0)} pages")
+            metadata['total_pages'] = _coerce_int(metadata.get('total_pages'), 0)
+            metadata['total_products'] = _coerce_int(metadata.get('total_products'), 0)
+
+            logger.info(
+                f"[METADATA] {metadata.get('project_name', 'Unknown')}: {metadata.get('total_pages', 0)} pages"
+            )
             
             # Step 3: Read checkpoint
             logger.info("[STEP 3] Reading checkpoint...")
@@ -1177,7 +1347,7 @@ class MetadataDrivenResumeScraper:
             
             # Step 5: Determine start URL based on checkpoint and project_url
             logger.info("[STEP 4] Determining start URL...")
-            highest_page = checkpoint['highest_successful_page']
+            highest_page = _coerce_int(checkpoint['highest_successful_page'], 0)
             log_value("checkpoint_highest_page", highest_page)
             log_value("project_url", project_url)
             
@@ -1190,7 +1360,7 @@ class MetadataDrivenResumeScraper:
             
             # RESUMED PROJECT: generate next page URL from project_url
             elif highest_page < metadata.get('total_pages', 0):
-                next_page = checkpoint['next_start_page']
+                next_page = _coerce_int(checkpoint['next_start_page'], highest_page + 1)
                 log_value("next_page (resumed)", next_page)
                 log_value("total_pages (metadata)", metadata.get('total_pages'))
                 
@@ -1249,7 +1419,8 @@ class MetadataDrivenResumeScraper:
                 'highest_successful_page': checkpoint['highest_successful_page'],
                 'next_start_page': next_page,
                 'total_pages': metadata.get('total_pages', 0),
-                'message': f"Run started for page {next_page}"
+                'total_persisted_records': checkpoint.get('total_persisted_records', 0),
+                'message': f"Run started for page {next_page}",
             }
         
         except Exception as e:

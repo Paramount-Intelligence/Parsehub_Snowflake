@@ -21,10 +21,23 @@ from src.services.auto_complete_service import register_run_for_completion
 
 logger = logging.getLogger(__name__)
 
-logger = logging.getLogger(__name__)
-
 # Create blueprint
 resume_bp = Blueprint('resume', __name__, url_prefix='/api/projects')
+
+
+def _projects_id_for_token(db: ParseHubDatabase, project_token: str) -> Optional[int]:
+    """
+    scraped_records / checkpoints use projects.id (FK), not metadata.id.
+    Always resolve via projects.token.
+    """
+    if not project_token:
+        return None
+    try:
+        pid = db.get_project_id_by_token(project_token)
+        return int(pid) if pid is not None else None
+    except Exception as e:
+        logger.warning(f"[resume] project id lookup failed: {e}")
+        return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -142,7 +155,9 @@ def start_resume_scraping():
             'highest_successful_page': result.get('highest_successful_page', 0),
             'next_start_page': result.get('next_start_page', 1),
             'total_pages': result.get('total_pages', 0),
-            'total_persisted_records': result.get('total_persisted_records', 0),
+            'total_persisted_records': result.get(
+                'total_persisted_records', checkpoint.get('total_persisted_records', 0)
+            ),
             'checkpoint': {
                 'highest_successful_page': checkpoint['highest_successful_page'],
                 'next_start_page': checkpoint['next_start_page'],
@@ -182,19 +197,24 @@ def get_resume_checkpoint(project_token: str):
         scraper = get_metadata_driven_scraper()
         
         # Lookup project_id from token
-        try:
-            metadata_list = db.get_metadata_filtered(project_token=project_token, limit=1)
-            if metadata_list and len(metadata_list) > 0:
-                project_id = metadata_list[0].get('id') or metadata_list[0].get('ID')
-            else:
-                project_id = hash(project_token) & 0x7FFFFFFF
-        except Exception as e:
-            logger.warning(f"[checkpoint] Error looking up project_id: {e}")
-            project_id = hash(project_token) & 0x7FFFFFFF
+        project_id = _projects_id_for_token(db, project_token)
+        if not project_id:
+            return jsonify({
+                'success': False,
+                'error': 'Project not found for token',
+                'highest_successful_page': 0,
+                'next_start_page': 1,
+                'total_persisted_records': 0,
+            }), 404
         
         checkpoint = scraper.get_checkpoint(project_id)
-        
-        return jsonify(checkpoint), 200
+        metadata = scraper.get_project_metadata(project_id) or {}
+        is_complete, _ = scraper.is_project_complete(project_id, metadata)
+        body = dict(checkpoint)
+        body['is_project_complete'] = is_complete
+        body['success'] = True
+        body['project_token'] = project_token
+        return jsonify(body), 200
         
     except Exception as e:
         logger.error(f'[checkpoint] Uncaught error: {e}', exc_info=True)
@@ -236,21 +256,11 @@ def get_resume_metadata(project_token: str):
         db: ParseHubDatabase = g.db
         scraper = get_metadata_driven_scraper()
         
-        # Lookup project_id from token
-        try:
-            metadata_list = db.get_metadata_filtered(project_token=project_token, limit=1)
-            if metadata_list and len(metadata_list) > 0:
-                project_id = metadata_list[0].get('id') or metadata_list[0].get('ID')
-            else:
-                return jsonify({
-                    'success': False,
-                    'error': 'Project not found'
-                }), 404
-        except Exception as e:
-            logger.warning(f"[metadata] Error looking up project: {e}")
+        project_id = _projects_id_for_token(db, project_token)
+        if not project_id:
             return jsonify({
                 'success': False,
-                'error': 'Error looking up project'
+                'error': 'Project not found for token',
             }), 404
         
         # Get metadata
@@ -268,26 +278,40 @@ def get_resume_metadata(project_token: str):
         is_complete, _ = scraper.is_project_complete(project_id, metadata)
         
         # Calculate progress
-        total_pages = metadata.get('total_pages', 0)
+        total_pages = int(metadata.get('total_pages') or 0)
+        hp = int(checkpoint.get('highest_successful_page') or 0)
         progress_percentage = 0
         if total_pages > 0:
-            progress_percentage = min(100, int((checkpoint['highest_successful_page'] / total_pages) * 100))
-        
-        return jsonify({
-            'success': True,
+            progress_percentage = min(100, int((hp / total_pages) * 100))
+
+        listing_url = metadata.get('website_url') or ''
+        meta_block = {
             'project_id': metadata['project_id'],
             'project_name': metadata['project_name'],
-            'website_url': metadata['website_url'],  # Original URL for the project
+            'website_url': listing_url,
+            'base_url': listing_url,
             'total_pages': total_pages,
-            'total_products': metadata.get('total_products', 0),
-            'current_page_scraped': checkpoint['highest_successful_page'],
+            'total_products': int(metadata.get('total_products') or 0),
+            'current_page_scraped': hp,
+        }
+
+        return jsonify({
+            'success': True,
+            'metadata': meta_block,
+            'project_id': metadata['project_id'],
+            'project_name': metadata['project_name'],
+            'website_url': listing_url,
+            'total_pages': total_pages,
+            'total_products': int(metadata.get('total_products') or 0),
+            'current_page_scraped': hp,
             'checkpoint': {
                 'highest_successful_page': checkpoint['highest_successful_page'],
                 'next_start_page': checkpoint['next_start_page'],
-                'total_persisted_records': checkpoint['total_persisted_records']
+                'total_persisted_records': checkpoint['total_persisted_records'],
+                'is_project_complete': is_complete,
             },
             'is_complete': is_complete,
-            'progress_percentage': progress_percentage
+            'progress_percentage': progress_percentage,
         }), 200
         
     except Exception as e:

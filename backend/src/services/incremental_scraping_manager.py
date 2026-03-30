@@ -36,10 +36,31 @@ if str(root_dir) not in sys.path:
 
 from src.models.database import ParseHubDatabase
 from src.services.chunk_pagination_orchestrator import ChunkPaginationOrchestrator
+from src.services.metadata_driven_resume_scraper import get_metadata_driven_scraper
 
 load_dotenv('.env')
 
 BASE_URL = os.getenv('PARSEHUB_BASE_URL', 'https://www.parsehub.com/api/v2')
+
+
+def _coerce_int(val, default: int = 0) -> int:
+    """Snowflake / drivers may return numbers as str; normalize for arithmetic."""
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return int(val)
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(val)
+    try:
+        s = str(val).strip()
+        if not s:
+            return default
+        return int(float(s))
+    except (ValueError, TypeError, OverflowError):
+        return default
+
 
 # Configure logging
 logging.basicConfig(
@@ -62,25 +83,57 @@ class IncrementalScrapingManager:
         if not self.api_key:
             raise ValueError("PARSEHUB_API_KEY not configured")
 
+    def _sum_completed_pages_for_project(self, project_id: int) -> int:
+        """
+        SUM(pages_scraped) for completed runs. Uses its own connect/disconnect cycle because
+        nested paths (e.g. ensure_run_started) call disconnect() and would invalidate a
+        long-lived cursor from a previous connect.
+        """
+        self.db.connect()
+        cursor = self.db.cursor()
+        try:
+            cursor.execute(
+                '''
+                SELECT SUM(pages_scraped) as total_pages_db
+                FROM runs
+                WHERE project_id = %s AND status = 'completed'
+                ''',
+                (project_id,),
+            )
+            result = cursor.fetchone()
+            if not result:
+                return 0
+            raw = (
+                result['total_pages_db']
+                if isinstance(result, dict)
+                else result[0]
+            )
+            return _coerce_int(raw, 0)
+        finally:
+            self.db.disconnect()
+
     def check_and_match_pages(self):
         """
         Check all projects and match project_id from projects table with metadata
         If scraped pages < total pages, automatically trigger continuation run
         """
         try:
-            conn = self.db.connect()
-            cursor = conn.cursor()
+            try:
+                self.db.connect()
+                cursor = self.db.cursor()
 
-            # Get all projects that have metadata
-            cursor.execute('''
-                SELECT p.id, p.token, m.total_pages, m.current_page_scraped, m.project_name
-                FROM projects p
-                INNER JOIN metadata m ON p.id = m.project_id
-                WHERE m.total_pages > 0
-                ORDER BY p.id
-            ''')
+                # Get all projects that have metadata
+                cursor.execute('''
+                    SELECT p.id, p.token, m.total_pages, m.current_page_scraped, m.project_name
+                    FROM projects p
+                    INNER JOIN metadata m ON p.id = m.project_id
+                    WHERE m.total_pages > 0
+                    ORDER BY p.id
+                ''')
 
-            projects = cursor.fetchall()
+                projects = cursor.fetchall()
+            finally:
+                self.db.disconnect()
 
             if not projects:
                 print("[OK] No projects found with metadata")
@@ -88,34 +141,71 @@ class IncrementalScrapingManager:
 
             continuation_results = []
 
-            for project_id, project_token, total_pages, current_page_scraped, project_name in projects:
+            for row in projects:
+                # SnowflakeCursorShim returns list[dict] with lowercase keys — do not tuple-unpack.
+                if isinstance(row, dict):
+                    project_id = row.get('id')
+                    project_token = row.get('token')
+                    total_pages = row.get('total_pages')
+                    current_page_scraped = row.get('current_page_scraped')
+                    project_name = row.get('project_name') or ''
+                else:
+                    (
+                        project_id,
+                        project_token,
+                        total_pages,
+                        current_page_scraped,
+                        project_name,
+                    ) = row
+
+                project_id = _coerce_int(project_id)
+                total_pages = _coerce_int(total_pages)
+                current_page_scraped = _coerce_int(current_page_scraped)
+                project_token = str(project_token or '').strip()
+                project_name = str(project_name or '')
+
                 print(f"\n{'='*80}")
+                tok_short = project_token[:8] if len(project_token) >= 8 else project_token
                 print(
-                    f"Project: {project_name} (ID: {project_id}, Token: {project_token[:8]}...)")
+                    f"Project: {project_name} (ID: {project_id}, Token: {tok_short}...)")
                 print(
                     f"Metadata: {current_page_scraped}/{total_pages} pages scraped")
 
-                # Calculate how many pages have been scraped from database runs
-                cursor.execute('''
-                    SELECT SUM(pages_scraped) as total_pages_db
-                    FROM runs
-                    WHERE project_id = %s AND status = 'completed'
-                ''', (project_id,))
-
-                result = cursor.fetchone()
-                pages_from_runs = (result['total_pages_db'] if isinstance(result, dict) else result[0]) or 0
+                pages_from_runs = self._sum_completed_pages_for_project(project_id)
 
                 print(f"Database: {pages_from_runs} pages from completed runs")
-                print(
-                    f"Difference: {total_pages - current_page_scraped} pages remaining")
 
-                # Check if scraping is incomplete
-                if current_page_scraped < total_pages:
-                    next_page = current_page_scraped + 1
-                    remaining_pages = total_pages - current_page_scraped
-
+                # Merged checkpoint (scraped_records + metadata.current_page_scraped + analytics_records).
+                # If we only used metadata.current_page_scraped, progress stored only in analytics would
+                # show 0 here and we'd always schedule page 1 — same symptom as "did not resume".
+                highest_done = current_page_scraped
+                next_page = current_page_scraped + 1
+                try:
+                    scraper = get_metadata_driven_scraper()
+                    cp = scraper.get_checkpoint(project_id)
+                    highest_done = _coerce_int(cp.get("highest_successful_page"), highest_done)
+                    next_page = _coerce_int(cp.get("next_start_page"), next_page)
                     print(
-                        f"\n[>] Scheduling continuation from page {next_page}")
+                        f"Checkpoint (merged): highest_successful_page={highest_done}, "
+                        f"next_start_page={next_page}, records={cp.get('total_persisted_records')}"
+                    )
+                except Exception as ex:
+                    logger.warning(
+                        "[incremental] get_checkpoint failed, using metadata only: %s",
+                        ex,
+                    )
+
+                remaining_pages = max(0, total_pages - highest_done)
+                print(
+                    f"Difference: {remaining_pages} pages remaining "
+                    f"(total_pages={total_pages} - highest_done={highest_done})"
+                )
+
+                # Check if scraping is incomplete (merged progress, not metadata row alone)
+                if highest_done < total_pages:
+                    print(
+                        f"\n[>] Scheduling continuation from page {next_page}"
+                    )
                     print(f"  Remaining pages to scrape: {remaining_pages}")
 
                     # Trigger the run
@@ -145,7 +235,6 @@ class IncrementalScrapingManager:
                     print(
                         f"[OK] Project is complete (all {total_pages} pages scraped)")
 
-            conn.close()
             return continuation_results
 
         except Exception as e:
@@ -443,7 +532,7 @@ class IncrementalScrapingManager:
             ''')
 
             active_runs = cursor.fetchall()
-            conn.close()
+            self.db.disconnect()
 
             for row in active_runs:
                 run_id = row['id'] if isinstance(row, dict) else row[0]
@@ -480,7 +569,7 @@ class IncrementalScrapingManager:
                     print(f"  Run completed! Updating metadata...")
                     self.update_metadata_pages(project_id, pages_scraped)
 
-                conn.close()
+                self.db.disconnect()
 
         except Exception as e:
             print(f"Error monitoring continuation runs: {e}")
@@ -515,7 +604,7 @@ class IncrementalScrapingManager:
                 print(
                     f"    Updated metadata: {new_current_page}/{total_pages} pages")
 
-            conn.close()
+            self.db.disconnect()
 
         except Exception as e:
             print(f"Error updating metadata: {e}")

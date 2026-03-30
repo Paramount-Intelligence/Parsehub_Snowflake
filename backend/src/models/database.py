@@ -4,7 +4,7 @@ import hashlib
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import threading
 import time
 import logging
@@ -22,6 +22,34 @@ def stable_scraped_data_id(run_token: str, index: int) -> int:
     s = f"{run_token}:{index}"
     return int(hashlib.md5(s.encode()).hexdigest(), 16) % (10 ** 12)
 
+
+def stable_analytics_record_id(project_token: str, run_token: str, record_index: int) -> int:
+    """Deterministic ANALYTICS_RECORDS.id (Snowflake requires explicit PK)."""
+    s = f"ar:{project_token}:{run_token}:{record_index}"
+    return int(hashlib.md5(s.encode()).hexdigest(), 16) % (10 ** 12)
+
+
+def stable_analytics_cache_id(project_token: str) -> int:
+    """Deterministic id for analytics_cache row (one row per project_token)."""
+    s = f"acache:{project_token}"
+    return int(hashlib.md5(s.encode()).hexdigest(), 16) % (10 ** 10)
+
+
+def stable_csv_export_id(project_token: str, run_token: str) -> int:
+    """Deterministic id for csv_exports row."""
+    s = f"csv:{project_token}:{run_token}"
+    return int(hashlib.md5(s.encode()).hexdigest(), 16) % (10 ** 10)
+
+
+def new_monitoring_session_id(project_id: int, run_token: str) -> int:
+    """
+    Unique MONITORING_SESSIONS.id per insert. SnowflakeCursorShim.lastrowid is always None,
+    so we must supply an explicit PK (required by init_snowflake.sql for this table).
+    """
+    s = f"ms:{project_id}:{run_token}:{time.time_ns()}"
+    return int(hashlib.md5(s.encode()).hexdigest(), 16) % (10 ** 10)
+
+
 logger = logging.getLogger(__name__)
 
 # Snowflake support (required)
@@ -34,7 +62,10 @@ except ImportError:
     )
 
 
-# Load environment variables from .env files
+# Load environment variables: backend/.env, backend/env, then src/models/.env
+_backend_root = Path(__file__).parent.parent.parent
+load_dotenv(_backend_root / '.env')
+load_dotenv(_backend_root / 'env')
 dotenv_path = Path(__file__).parent / ".env"
 if dotenv_path.exists():
     load_dotenv(dotenv_path)
@@ -53,6 +84,58 @@ def invalidate_metadata_columns_cache():
     _metadata_columns_cache_time = 0
     logger.info("[DB] Metadata columns cache invalidated")
 
+
+def _split_snowflake_init_statements(sql_text: str) -> list[str]:
+    """
+    Split init_snowflake.sql into single statements. The Snowflake Python connector
+    rejects one execute() with multiple statements (statement count mismatch).
+    Strips full-line -- comments; splits on ';' (this file has no semicolons in strings).
+    """
+    lines = []
+    for line in sql_text.splitlines():
+        if line.strip().startswith('--'):
+            continue
+        lines.append(line)
+    body = '\n'.join(lines)
+    return [p.strip() for p in body.split(';') if p.strip()]
+
+
+def _run_init_snowflake_sql(cursor, sql_path: Path) -> int:
+    """
+    Run init_snowflake.sql statement-by-statement.
+    Returns the number of statements executed successfully (not counting skipped CREATE INDEX).
+    """
+    raw = sql_path.read_text(encoding='utf-8')
+    statements = _split_snowflake_init_statements(raw)
+    ran = 0
+    skipped = 0
+    for stmt in statements:
+        head = stmt.lstrip().upper()
+        # Search indexes on non-hybrid tables can raise 391420 in some accounts; skip.
+        if head.startswith('CREATE INDEX'):
+            logger.debug('[DB] Skipping CREATE INDEX during Snowflake bootstrap: %s', stmt[:120])
+            skipped += 1
+            continue
+        try:
+            cursor.execute(stmt)
+            ran += 1
+        except Exception as ex:
+            msg = str(ex)
+            if 'already exists' in msg.lower():
+                logger.debug('[DB] init_snowflake.sql (exists): %s', msg[:200])
+                ran += 1
+            elif '42710' in msg or 'object already exists' in msg.lower():
+                logger.debug('[DB] init_snowflake.sql (object exists): %s', msg[:200])
+                ran += 1
+            else:
+                logger.warning('[DB] init_snowflake.sql statement failed: %s', msg[:500])
+    logger.info(
+        '[DB] init_snowflake.sql: executed %s statements, skipped %s (CREATE INDEX), total parts %s',
+        ran,
+        skipped,
+        len(statements),
+    )
+    return ran
 
 
 class ParseHubDatabase:
@@ -86,7 +169,12 @@ class ParseHubDatabase:
                 "Please set environment variables: SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_PASSWORD, SNOWFLAKE_DATABASE"
             )
         
-        print(f"Using Snowflake database: {self.sf_account}.{self.sf_database}.{self.sf_schema}")
+        if os.getenv('QUIET_SNOWFLAKE_DB_CONNECT_PRINT', '').strip().lower() not in (
+            '1', 'true', 'yes',
+        ):
+            print(
+                f"Using Snowflake database: {self.sf_account}.{self.sf_database}.{self.sf_schema}"
+            )
 
     @property
     def conn(self):
@@ -224,14 +312,18 @@ class ParseHubDatabase:
         conn = self.connect()
         cursor = self.cursor()
 
-        # Snowflake schema initialization
+        # Snowflake schema initialization (must run one statement per execute())
         try:
             sql_path = Path(__file__).parent / "init_snowflake.sql"
             if sql_path.exists():
-                with open(sql_path, 'r') as f:
-                    cursor.execute(f.read())
-                print("[DB] Snowflake schema initialized")
-                return
+                n_ok = _run_init_snowflake_sql(cursor, sql_path)
+                if n_ok > 0:
+                    print("[DB] Snowflake init_snowflake.sql applied (see logs for details)")
+                    return
+                print(
+                    "[DB] init_snowflake.sql ran 0 statements successfully; "
+                    "falling back to embedded schema DDL"
+                )
             else:
                 print("[DB] init_snowflake.sql not found, using standard schema")
         except Exception as e:
@@ -904,6 +996,94 @@ class ParseHubDatabase:
             conn.commit()
         finally:
             self.disconnect()
+
+    def insert_scraped_resume_batch(
+        self,
+        project_id: int,
+        run_token: str,
+        source_page: int,
+        records: List[Dict[str, Any]],
+        session_id: Optional[int] = None,
+        mirror_scraped_data: bool = True,
+    ) -> Tuple[int, Optional[str]]:
+        """
+        Insert rows into scraped_records using the same column layout as
+        MetadataDrivenResumeScraper.persist_results (session_id, project_id,
+        run_token, source_page, data_json, created_at). Optionally mirror into
+        scraped_data via insert_scraped_rows_for_run.
+
+        Returns (inserted_count, error_message). error_message is None on full success.
+        """
+        if not run_token or not str(run_token).strip():
+            return 0, 'run_token is required'
+        if not isinstance(project_id, int) or project_id <= 0:
+            return 0, 'project_id must be a positive integer'
+        if not isinstance(source_page, int) or source_page < 1:
+            return 0, 'source_page must be an integer >= 1'
+        if not records:
+            return 0, None
+        dict_rows = [r for r in records if isinstance(r, dict)]
+        if not dict_rows:
+            return 0, 'records must be a non-empty array of objects'
+
+        conn = self.connect()
+        cursor = self.cursor()
+        inserted = 0
+        try:
+            for record in dict_rows:
+                try:
+                    data_json = json.dumps(record, default=str)
+                    cursor.execute(
+                        '''
+                        INSERT INTO scraped_records
+                        (session_id, project_id, run_token, source_page, data_json, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ''',
+                        (
+                            session_id,
+                            project_id,
+                            run_token,
+                            source_page,
+                            data_json,
+                            datetime.now(),
+                        ),
+                    )
+                    inserted += 1
+                except Exception as row_e:
+                    logger.warning(
+                        '[DB] insert_scraped_resume_batch row skipped: %s', row_e
+                    )
+                    continue
+            conn.commit()
+        except Exception as e:
+            logger.error('[DB] insert_scraped_resume_batch failed: %s', e, exc_info=True)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return 0, str(e)
+        finally:
+            self.disconnect()
+
+        if mirror_scraped_data and inserted > 0:
+            try:
+                sd = self.insert_scraped_rows_for_run(run_token, project_id, dict_rows)
+                if sd == 0:
+                    logger.error(
+                        '[DB] insert_scraped_resume_batch: scraped_data mirror returned 0 '
+                        'for run_token=%s project_id=%s',
+                        run_token[:12] if run_token else None,
+                        project_id,
+                    )
+            except Exception as sd_e:
+                logger.error(
+                    '[DB] insert_scraped_resume_batch: scraped_data mirror failed: %s',
+                    sd_e,
+                    exc_info=True,
+                )
+                return inserted, f'scraped_records ok ({inserted} rows) but scraped_data mirror failed: {sd_e}'
+
+        return inserted, None
 
     def insert_scraped_rows_for_run(
         self,
@@ -1736,14 +1916,17 @@ class ParseHubDatabase:
         cursor = self.cursor()
 
         try:
-            cursor.execute('''
-                INSERT INTO monitoring_sessions 
-                (project_id, run_token, target_pages, status, start_time, created_at, updated_at)
-                VALUES (%s, %s, %s, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            ''', (project_id, run_token, target_pages))
+            session_id = new_monitoring_session_id(project_id, run_token)
+            cursor.execute(
+                '''
+                INSERT INTO monitoring_sessions
+                (id, project_id, run_token, target_pages, status, start_time, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ''',
+                (session_id, project_id, run_token, target_pages),
+            )
 
             conn.commit()
-            session_id = cursor.lastrowid
             return session_id
         except Exception as e:
             print(f"Error creating monitoring session: {e}")
@@ -2111,25 +2294,31 @@ class ParseHubDatabase:
                         safe_data[key] = str(value)
                 analytics_json = json.dumps(safe_data, default=str)
 
-            # Store analytics cache with error handling
+            # Store analytics cache with error handling (Snowflake: explicit id, DELETE then INSERT)
+            overview = analytics_data.get('overview', {})
+            data_quality = analytics_data.get('data_quality', {})
+            recovery = analytics_data.get('recovery', {})
+
+            total_records = overview.get('total_records_scraped', 0)
+            total_fields = data_quality.get('total_fields', 0)
+            total_runs = overview.get('total_runs', 0)
+            completed_runs = overview.get('completed_runs', 0)
+            progress_percentage = overview.get('progress_percentage', 0)
+            status = recovery.get('status', 'unknown')
+
             try:
-                overview = analytics_data.get('overview', {})
-                data_quality = analytics_data.get('data_quality', {})
-                recovery = analytics_data.get('recovery', {})
-
-                total_records = overview.get('total_records_scraped', 0)
-                total_fields = data_quality.get('total_fields', 0)
-                total_runs = overview.get('total_runs', 0)
-                completed_runs = overview.get('completed_runs', 0)
-                progress_percentage = overview.get('progress_percentage', 0)
-                status = recovery.get('status', 'unknown')
-
+                cursor.execute(
+                    'DELETE FROM analytics_cache WHERE project_token = %s',
+                    (project_token,),
+                )
+                cache_id = stable_analytics_cache_id(project_token)
                 cursor.execute('''
-                    INSERT OR REPLACE INTO analytics_cache
-                    (project_token, run_token, total_records, total_fields, total_runs, completed_runs, 
+                    INSERT INTO analytics_cache
+                    (id, project_token, run_token, total_records, total_fields, total_runs, completed_runs,
                      progress_percentage, status, analytics_json, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ''', (
+                    cache_id,
                     project_token,
                     run_token,
                     total_records,
@@ -2143,16 +2332,21 @@ class ParseHubDatabase:
                 ))
             except Exception as e:
                 print(f"Warning: Failed to store analytics cache: {e}")
-                # Attempt to continue with record storage
 
             # Store CSV data if provided
             if csv_data:
                 try:
+                    cursor.execute(
+                        'DELETE FROM csv_exports WHERE project_token = %s AND run_token = %s',
+                        (project_token, run_token),
+                    )
+                    csv_id = stable_csv_export_id(project_token, run_token)
                     cursor.execute('''
-                        INSERT OR REPLACE INTO csv_exports
-                        (project_token, run_token, csv_data, row_count, updated_at)
-                        VALUES (%s, %s, %s, %s, %s)
+                        INSERT INTO csv_exports
+                        (id, project_token, run_token, csv_data, row_count, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s)
                     ''', (
+                        csv_id,
                         project_token,
                         run_token,
                         csv_data,
@@ -2162,30 +2356,55 @@ class ParseHubDatabase:
                 except Exception as e:
                     print(f"Warning: Failed to store CSV data: {e}")
 
-            # Store individual records with batch processing
+            # Replace per-run analytics rows: explicit IDs + batched INSERTs for Snowflake
             stored_count = 0
-            batch_size = 100
+            try:
+                cursor.execute(
+                    'DELETE FROM analytics_records WHERE project_token = %s AND run_token = %s',
+                    (project_token, run_token),
+                )
+            except Exception as e:
+                print(f"Warning: Failed to clear old analytics_records: {e}")
+
+            batch_size = 80
             for idx in range(0, len(records), batch_size):
-                batch = records[idx:idx + batch_size]
-                for i, record in enumerate(batch):
-                    try:
-                        record_json = json.dumps(record, default=str) if isinstance(
-                            record, dict) else str(record)
-                        cursor.execute('''
-                            INSERT OR REPLACE INTO analytics_records
-                            (project_token, run_token, record_index, record_data)
-                            VALUES (%s, %s, %s, %s)
-                        ''', (
-                            project_token,
-                            run_token,
-                            idx + i,
-                            record_json
-                        ))
-                        stored_count += 1
-                    except Exception as e:
-                        print(
-                            f"Warning: Failed to store record {idx + i}: {e}")
-                        continue
+                chunk = records[idx:idx + batch_size]
+                if not chunk:
+                    continue
+                placeholders = []
+                params: List[Any] = []
+                for i, record in enumerate(chunk):
+                    global_idx = idx + i
+                    record_json = json.dumps(record, default=str) if isinstance(
+                        record, dict) else str(record)
+                    rid = stable_analytics_record_id(project_token, run_token, global_idx)
+                    placeholders.append('(%s, %s, %s, %s, %s)')
+                    params.extend([rid, project_token, run_token, global_idx, record_json])
+                try:
+                    sql = f'''
+                        INSERT INTO analytics_records
+                        (id, project_token, run_token, record_index, record_data)
+                        VALUES {', '.join(placeholders)}
+                    '''
+                    cursor.execute(sql, tuple(params))
+                    stored_count += len(chunk)
+                except Exception as e:
+                    print(f"Warning: Failed analytics_records batch at offset {idx}: {e}")
+                    # Fallback: row-by-row for this chunk only
+                    for i, record in enumerate(chunk):
+                        global_idx = idx + i
+                        try:
+                            record_json = json.dumps(record, default=str) if isinstance(
+                                record, dict) else str(record)
+                            rid = stable_analytics_record_id(project_token, run_token, global_idx)
+                            cursor.execute('''
+                                INSERT INTO analytics_records
+                                (id, project_token, run_token, record_index, record_data)
+                                VALUES (%s, %s, %s, %s, %s)
+                            ''', (rid, project_token, run_token, global_idx, record_json))
+                            stored_count += 1
+                        except Exception as row_e:
+                            print(f"Warning: Failed to store record {global_idx}: {row_e}")
 
             conn.commit()
             self.disconnect()

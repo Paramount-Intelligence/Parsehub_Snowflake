@@ -95,6 +95,25 @@ CREATE TABLE IF NOT EXISTS scraped_data (
     FOREIGN KEY (project_token) REFERENCES projects(token)
 );
 
+-- Monitoring sessions (FK target for scraped_records.session_id)
+CREATE TABLE IF NOT EXISTS monitoring_sessions (
+    id INTEGER PRIMARY KEY,
+    project_id INTEGER NOT NULL,
+    run_token VARCHAR(255) NOT NULL,
+    target_pages INTEGER DEFAULT 1,
+    status VARCHAR(50) DEFAULT 'active',
+    start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+    end_time TIMESTAMP,
+    total_records INTEGER DEFAULT 0,
+    total_pages INTEGER DEFAULT 0,
+    progress_percentage FLOAT DEFAULT 0,
+    current_url VARCHAR(2000),
+    error_message TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+    FOREIGN KEY (project_id) REFERENCES projects(id)
+);
+
 -- Scraped Records table - used by metadata-driven resume scraper
 CREATE TABLE IF NOT EXISTS scraped_records (
     id INTEGER IDENTITY(1,1) PRIMARY KEY,
