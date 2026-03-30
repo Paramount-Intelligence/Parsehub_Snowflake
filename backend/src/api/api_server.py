@@ -36,6 +36,7 @@ from src.services.analytics_service import AnalyticsService
 from src.services.excel_import_service import ExcelImportService
 from src.services.auto_runner_service import AutoRunnerService
 from src.services.group_run_service import GroupRunService
+from src.services.msa_project_sync_service import sync_msa_projects
 from src.api.fetch_projects import fetch_all_projects, get_all_projects_with_cache
 from src.services.incremental_scraping_scheduler import start_incremental_scraping_scheduler, stop_incremental_scraping_scheduler
 from src.services.auto_sync_service import start_auto_sync_service, stop_auto_sync_service, get_auto_sync_service
@@ -1510,6 +1511,34 @@ def sync_projects():
     except Exception as e:
         logger.error(f'[API] Error syncing projects: {str(e)}')
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/projects/sync-msa', methods=['POST'])
+def sync_msa_projects_endpoint():
+    """
+    Optimised MSA sync pipeline:
+      - Concurrent ParseHub fetch (5 workers)
+      - Batched Snowflake MERGE INTO upsert
+      - Returns only (MSA Pricing) projects
+    """
+    try:
+        json_data = request.get_json(silent=True) or {}
+        api_key = json_data.get('api_key') or os.getenv('PARSEHUB_API_KEY')
+
+        if not api_key:
+            return jsonify({'error': 'Missing API key'}), 400
+
+        logger.info('[API] Starting MSA project sync pipeline...')
+        result = sync_msa_projects(api_key, g.db)
+        logger.info(
+            '[API] MSA sync complete: %d projects returned',
+            result.get('count', 0),
+        )
+        return jsonify(result), 200
+
+    except Exception as e:
+        logger.error(f'[API] Error in sync-msa: {str(e)}')
+        return jsonify({'error': str(e), 'success': False}), 500
 
 
 @app.route('/api/projects/search', methods=['GET'])
