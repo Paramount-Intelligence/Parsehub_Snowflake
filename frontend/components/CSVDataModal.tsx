@@ -6,6 +6,9 @@ import { useState, useEffect } from "react";
 import { Download, Eye, FileJson, Loader2, FileText } from "lucide-react";
 import Modal from "./Modal";
 
+/** Large ParseHub CSV + Snowflake paths can exceed 2m; keep in sync with ColumnStatisticsModal. */
+const ANALYTICS_FETCH_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
 interface CSVDataModalProps {
   token: string;
   title: string;
@@ -35,9 +38,11 @@ export default function CSVDataModal({
     setLoading(true);
     setError(null);
     try {
-      // Add 120 second timeout for large datasets
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 120000);
+      const timeoutId = setTimeout(
+        () => controller.abort(),
+        ANALYTICS_FETCH_TIMEOUT_MS,
+      );
 
       try {
         const response = await fetch(
@@ -56,14 +61,19 @@ export default function CSVDataModal({
 
         const result = await response.json();
 
-        // Extract CSV data
-        if (result.csv_data) {
+        // Extract normalized rows and fallback raw CSV
+        if (result.rows && result.rows.length > 0) {
+          setJsonData(result.rows);
+          if (result.csv_data) {
+            setCSVData(result.csv_data);
+          }
+        } else if (result.csv_data) {
           setCSVData(result.csv_data);
-          // Parse CSV to JSON for table view
+          // Fallback parsing if backend rows are missing
           parseCSVToJSON(result.csv_data);
         } else {
           setError(
-            "No CSV data found for this project. Try running the project first.",
+            result.message || "No data found for this project. Try running the project first.",
           );
         }
       } finally {
@@ -72,7 +82,7 @@ export default function CSVDataModal({
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") {
         setError(
-          "Request timed out (took longer than 120 seconds). The dataset might be too large - try again or contact support.",
+          "Request timed out (took longer than 5 minutes). The dataset might be too large - try again or contact support.",
         );
       } else {
         setError(err instanceof Error ? err.message : "Unknown error occurred");
@@ -155,29 +165,27 @@ export default function CSVDataModal({
             <p className="font-medium">Error: {error}</p>
           </div>
         </div>
-      ) : csvData ? (
+      ) : (csvData || jsonData.length > 0) ? (
         <div className="space-y-6">
           {/* Header with download buttons */}
           <div className="flex items-center justify-between gap-4 flex-wrap">
             <div className="flex items-center gap-2 bg-slate-800/50 backdrop-blur-sm rounded-lg p-1 border border-slate-700/50">
               <button
                 onClick={() => setViewMode("table")}
-                className={`flex items-center gap-2 px-4 py-2 rounded-md font-medium transition-all duration-200 ${
-                  viewMode === "table"
+                className={`flex items-center gap-2 px-4 py-2 rounded-md font-medium transition-all duration-200 ${viewMode === "table"
                     ? "bg-gradient-to-r from-blue-600 to-blue-500 text-white shadow-lg shadow-blue-500/20"
                     : "text-slate-400 hover:text-slate-200 hover:bg-slate-700/50"
-                }`}
+                  }`}
               >
                 <Eye className="w-4 h-4" />
                 Table View
               </button>
               <button
                 onClick={() => setViewMode("raw")}
-                className={`flex items-center gap-2 px-4 py-2 rounded-md font-medium transition-all duration-200 ${
-                  viewMode === "raw"
+                className={`flex items-center gap-2 px-4 py-2 rounded-md font-medium transition-all duration-200 ${viewMode === "raw"
                     ? "bg-gradient-to-r from-blue-600 to-blue-500 text-white shadow-lg shadow-blue-500/20"
                     : "text-slate-400 hover:text-slate-200 hover:bg-slate-700/50"
-                }`}
+                  }`}
               >
                 <FileJson className="w-4 h-4" />
                 Raw CSV
@@ -223,9 +231,8 @@ export default function CSVDataModal({
                     {jsonData.map((row, idx) => (
                       <tr
                         key={idx}
-                        className={`border-b border-slate-800 transition-colors duration-150 ${
-                          idx % 2 === 0 ? "bg-slate-900/50" : "bg-slate-900/30"
-                        } hover:bg-slate-800/50`}
+                        className={`border-b border-slate-800 transition-colors duration-150 ${idx % 2 === 0 ? "bg-slate-900/50" : "bg-slate-900/30"
+                          } hover:bg-slate-800/50`}
                       >
                         {Object.values(row).map((value: any, cellIdx) => (
                           <td

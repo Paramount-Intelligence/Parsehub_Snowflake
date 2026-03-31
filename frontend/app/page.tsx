@@ -19,6 +19,7 @@ import StatsCard from "@/components/StatsCard";
 import Header from "@/components/Header";
 import AllProjectsAnalyticsModal from "@/components/AllProjectsAnalyticsModal";
 import apiClient from "@/lib/apiClient";
+import axios from "axios";
 
 import RunDialog from "@/components/RunDialog";
 import { useRealTimeMonitoring } from "@/lib/useRealTimeMonitoring";
@@ -49,6 +50,24 @@ function isBackendDown(err: unknown): boolean {
     msg.includes("failed to fetch") ||
     msg.includes("network error") ||
     msg.includes("backend")
+  );
+}
+
+/** Aborted request — timeout, navigation, HMR, or explicit abort. Not a server failure. */
+function isRequestCanceled(err: unknown): boolean {
+  if (axios.isCancel(err)) return true;
+  if (err instanceof DOMException && err.name === "AbortError") return true;
+  if (typeof err === "object" && err !== null) {
+    const e = err as Record<string, unknown>;
+    const orig = e.originalError as { code?: string; name?: string } | undefined;
+    if (orig?.code === "ERR_CANCELED" || orig?.name === "CanceledError") return true;
+  }
+  const msg = extractErrorMessage(err).toLowerCase();
+  return (
+    msg === "canceled" ||
+    msg === "cancelled" ||
+    msg.includes("request aborted") ||
+    msg.includes("the user aborted a request")
   );
 }
 
@@ -106,6 +125,7 @@ export default function Home() {
   const [showFilters, setShowFilters] = useState(true); // Show filters by default
   const [syncing, setSyncing] = useState(false);
   const [syncMessage, setSyncMessage] = useState<string | null>(null);
+  const [msaSyncing, setMsaSyncing] = useState(false); // guard: prevents duplicate sync-msa calls
   const [fetchAll, setFetchAll] = useState(false); // Toggle for fetching all projects vs paginated
 
   // Real-time monitoring hook
@@ -114,15 +134,17 @@ export default function Home() {
   useEffect(() => {
     fetchFilters();
     fetchMetadata();
+    fetchMsaProjects();
+    // Auto-refresh uses the lightweight fetchProjects (DB read only).
+    // fetchMsaProjects (full ParseHub sync) is only triggered manually.
     const interval = setInterval(() => {
-      fetchProjects();
       fetchMetadata();
-    }, 30000); // Refresh every 30s
+    }, 30000);
     return () => clearInterval(interval);
   }, []);
 
   useEffect(() => {
-    fetchProjects();
+    fetchMsaProjects();
   }, [
     selectedRegion,
     selectedCountry,
@@ -174,6 +196,7 @@ export default function Home() {
   };
 
   const fetchProjects = async () => {
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
     try {
       setError(null);
       let url = "/api/projects";
@@ -199,12 +222,15 @@ export default function Home() {
 
       // Use 120 second timeout for paginated requests - backend can be slow
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 120000);
+      timeoutId = setTimeout(() => controller.abort(), 120000);
 
       const response = await apiClient.get(url, {
         signal: controller.signal,
       });
-      clearTimeout(timeoutId);
+      if (timeoutId !== undefined) {
+        clearTimeout(timeoutId);
+        timeoutId = undefined;
+      }
 
       const data = response.data;
       console.log(
@@ -254,12 +280,14 @@ export default function Home() {
           try {
             const metaRes = await fetch(`/api/metadata?project_token=${project.token}`);
             const metaData = await metaRes.json();
-            
+
             if (metaData.success && metaData.records?.length > 0) {
               project.metadata = metaData.records[0];
             }
           } catch (err) {
-            console.error(`Failed to fetch metadata for ${project.token}:`, err);
+            if (!isRequestCanceled(err)) {
+              console.error(`Failed to fetch metadata for ${project.token}:`, err);
+            }
           }
           return project;
         })
@@ -289,6 +317,14 @@ export default function Home() {
 
       setLoading(false);
     } catch (err) {
+      if (timeoutId !== undefined) {
+        clearTimeout(timeoutId);
+      }
+      if (isRequestCanceled(err)) {
+        // Timeout abort, Fast Refresh, navigation, or replaced request — not a backend fault
+        setLoading(false);
+        return;
+      }
       const errorMsg = extractErrorMessage(err);
       // Only log non-network errors to avoid console spam
       if (!isBackendDown(err)) {
@@ -319,7 +355,7 @@ export default function Home() {
 
       // Refresh projects after sync
       setTimeout(() => {
-        fetchProjects();
+        fetchMsaProjects();
         setSyncing(false);
       }, 1000);
     } catch (err) {
@@ -330,11 +366,87 @@ export default function Home() {
     }
   };
 
+  /**
+   * Fetch MSA projects via the optimised sync-msa endpoint.
+   * Concurrent ParseHub fetch + Snowflake upsert + (MSA Pricing) filter.
+   */
+  const fetchMsaProjects = async () => {
+    // Duplicate-call guard: prevent concurrent sync-msa requests
+    if (msaSyncing) {
+      console.log("[Home] MSA sync already in progress — skipping");
+      return;
+    }
+    try {
+      setError(null);
+      setLoading(true);
+      setMsaSyncing(true);
+
+      console.log("[Home] Fetching MSA projects via sync-msa pipeline...");
+
+      const response = await apiClient.post("/api/projects/sync-msa");
+      const data = response.data;
+
+      console.log(
+        "[Home] MSA sync returned",
+        data.count,
+        "projects (total fetched:",
+        data.total_fetched,
+        ", partial_failure:",
+        data.partial_failure,
+        ")"
+      );
+
+      if (data.partial_failure) {
+        console.warn("[Home] sync-msa reported partial_failure:", data.error);
+      }
+
+      const allProjects: Project[] = data.projects || [];
+
+      setProjects(allProjects);
+      setLastUpdate(new Date());
+      setBackendDown(false);
+
+      // Calculate stats from returned projects
+      const running = allProjects.filter(
+        (p: Project) => p.last_run?.status === "running"
+      ).length;
+      const completed = allProjects.filter(
+        (p: Project) => p.last_run?.status === "complete"
+      ).length;
+      const queued = allProjects.filter(
+        (p: Project) => p.last_run?.status === "queued"
+      ).length;
+
+      setStats({
+        total: allProjects.length,
+        running,
+        completed,
+        queued,
+      });
+
+      setLoading(false);
+      setMsaSyncing(false);
+    } catch (err) {
+      setMsaSyncing(false);
+      if (isRequestCanceled(err)) {
+        setLoading(false);
+        return;
+      }
+      const errorMsg = extractErrorMessage(err);
+      if (!isBackendDown(err)) {
+        console.error("[Home] Error fetching MSA projects:", errorMsg);
+      }
+      setError(errorMsg);
+      setBackendDown(isBackendDown(err));
+      setLoading(false);
+    }
+  };
+
   const handleRunAll = async () => {
     try {
       setError(null);
       await apiClient.post("/api/projects/run-all");
-      setTimeout(fetchProjects, 1000);
+      setTimeout(fetchMsaProjects, 1000);
 
     } catch (err) {
       setError(extractErrorMessage(err));
@@ -378,7 +490,7 @@ export default function Home() {
                   </p>
                 </div>
                 <button
-                  onClick={() => { setError(null); setBackendDown(false); fetchProjects(); }}
+                  onClick={() => { setError(null); setBackendDown(false); fetchMsaProjects(); }}
                   className="flex-shrink-0 flex items-center gap-2 px-4 py-2 bg-amber-700 hover:bg-amber-600 text-white text-sm font-medium rounded-lg transition-colors"
                 >
                   <RefreshCw className="w-4 h-4" />
@@ -395,7 +507,7 @@ export default function Home() {
                 <p className="text-red-400 text-sm mt-0.5 break-words">{error}</p>
               </div>
               <button
-                onClick={() => { setError(null); fetchProjects(); }}
+                onClick={() => { setError(null); fetchMsaProjects(); }}
                 className="flex-shrink-0 flex items-center gap-2 px-4 py-1.5 bg-red-800 hover:bg-red-700 text-white text-sm font-medium rounded-lg transition-colors"
               >
                 <RefreshCw className="w-3.5 h-3.5" />
@@ -494,12 +606,12 @@ export default function Home() {
             {showFilters ? "Hide" : "Show"} Filters {hasActiveFilters && "✓"}
           </button>
           <button
-            onClick={fetchProjects}
-            disabled={loading}
+            onClick={fetchMsaProjects}
+            disabled={loading || msaSyncing}
             className="inline-flex items-center gap-2 px-6 py-3.5 bg-slate-800 hover:bg-slate-700 disabled:bg-slate-800/50 border border-slate-700 hover:border-slate-600 rounded-xl font-semibold transition-all duration-200 disabled:cursor-not-allowed"
           >
-            <Activity className={`w-5 h-5 ${loading ? "animate-spin" : ""}`} />
-            Refresh
+            <Activity className={`w-5 h-5 ${msaSyncing ? "animate-spin" : ""}`} />
+            {msaSyncing ? "Syncing..." : "Refresh"}
           </button>
           {lastUpdate && (
             <div className="ml-auto flex items-center gap-2 px-4 py-2 bg-slate-800/50 border border-slate-700/50 rounded-xl">
@@ -656,7 +768,7 @@ export default function Home() {
               console.error("Failed to start monitoring:", err);
             }
 
-            await fetchProjects();
+            await fetchMsaProjects();
             // Show analytics modal for all projects
             setAnalyticsOpen(true);
           }}

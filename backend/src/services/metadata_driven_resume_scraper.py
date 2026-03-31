@@ -324,6 +324,7 @@ class MetadataDrivenResumeScraper:
                 'project_name': safe_str(normalized.get('project_name', 'Unknown')) or 'Unknown',
                 'website_url': listing_url,
                 'last_known_url': lk,
+                'next_page_url': safe_str(normalized.get('next_page_url', '')),
                 'total_pages': _coerce_int(normalized.get('total_pages'), 0),
                 'total_products': _coerce_int(normalized.get('total_products'), 0),
                 'project_token': safe_str(normalized.get('project_token', '')),
@@ -600,6 +601,48 @@ class MetadataDrivenResumeScraper:
                 return f"{base_url}&page={next_page}"
             else:
                 return f"{base_url}?page={next_page}"
+                
+    def build_resume_url_from_next_page_url(self, next_page_url_template: str, next_page: int) -> str:
+        """
+        Build resume URL by replacing the numeric pagination token inside the next_page_url template.
+        """
+        if not next_page_url_template or not isinstance(next_page_url_template, str):
+            raise ValueError(f"next_page_url_template must be a non-empty string, got {type(next_page_url_template).__name__}")
+            
+        url = next_page_url_template.strip()
+        if not url:
+            raise ValueError("next_page_url_template string is empty")
+            
+        logger.debug(f"[URL_GEN] Building resume URL from template: {url} for page {next_page}")
+        
+        # Pattern 1: ?page=X or &page=X
+        if re.search(r'[?&]page=\d+', url):
+            return re.sub(r'([?&]page=)\d+', rf'\g<1>{next_page}', url)
+            
+        # Pattern 2: ?p=X or &p=X
+        if re.search(r'[?&]p=\d+', url):
+            return re.sub(r'([?&]p=)\d+', rf'\g<1>{next_page}', url)
+            
+        # Pattern 3: ?offset=X or &offset=X
+        if re.search(r'[?&]offset=\d+', url):
+            offset = (next_page - 1) * 20
+            return re.sub(r'([?&]offset=)\d+', rf'\g<1>{offset}', url)
+            
+        # Pattern 4: /page/X/ or /page/X
+        if re.search(r'/page/\d+', url):
+            return re.sub(r'(/page/)\d+', rf'\g<1>{next_page}', url)
+            
+        # Fallback: replace the last sequence of digits in the URL
+        def replace_last_digits(match):
+            return str(next_page) + match.group(2)
+            
+        # (\d+) matches the last sequence of digits
+        # ([^0-9]*)$ matches everything after it until the end of string
+        new_url, count = re.subn(r'(\d+)([^0-9]*)$', replace_last_digits, url)
+        if count == 0:
+            raise ValueError(f"Could not find any numeric pagination token in next_page_url: {url}")
+            
+        return new_url
     
     def _detect_pagination_pattern(self, url: str) -> str:
         """Detect pagination pattern in URL"""
@@ -1261,10 +1304,9 @@ class MetadataDrivenResumeScraper:
         Main orchestration method: resume or start scraping for a project
         
         URL Behavior:
-        - Always uses project_url from projects table (source of truth)
-        - Does not depend on metadata.WEBSITE_URL or metadata.LAST_KNOWN_URL
-        - First run: uses project_url directly
-        - Resume run: uses generate_next_page_url(project_url, highest_page + 1)
+        - First run uses project URL
+        - Resumed runs prefer metadata.next_page_url template
+        - Fallback exists if metadata template is missing or invalid
         
         Returns:
             {
@@ -1358,25 +1400,35 @@ class MetadataDrivenResumeScraper:
                 log_value("start_url (fresh)", start_url)
                 logger.info(f"[URL] Fresh project (first run) - using project URL: {start_url}")
             
-            # RESUMED PROJECT: generate next page URL from project_url
+            # RESUMED PROJECT: use metadata.next_page_url template, fallback to project_url
             elif highest_page < metadata.get('total_pages', 0):
                 next_page = _coerce_int(checkpoint['next_start_page'], highest_page + 1)
                 log_value("next_page (resumed)", next_page)
                 log_value("total_pages (metadata)", metadata.get('total_pages'))
                 
-                logger.info(f"[URL] Resumed project - generating URL for page {next_page} from project URL")
+                next_page_url = safe_str(metadata.get('next_page_url', ''))
+                start_url = None
                 
-                try:
-                    start_url = self.generate_next_page_url(
-                        project_url,
-                        next_page,
-                        None
-                    )
-                    log_value("start_url_generated", start_url)
-                    logger.info(f"[URL] Resumed project - generated URL for page {next_page}: {start_url}")
-                except Exception as e:
-                    logger.error(f"[ERROR] Failed to generate next page URL: {str(e)}")
-                    raise
+                if next_page_url:
+                    logger.info(f"[URL] Resumed project - using metadata.next_page_url template")
+                    try:
+                        start_url = self.build_resume_url_from_next_page_url(next_page_url, next_page)
+                        logger.info(f"[URL] Built resume URL from next_page_url: {start_url}")
+                    except Exception as e:
+                        logger.warning(f"[URL] Error building resume URL from next_page_url: {e}")
+                        logger.info(f"[URL] metadata.next_page_url invalid; falling back to project_url generation")
+                else:
+                    logger.info(f"[URL] metadata.next_page_url missing; falling back to project_url generation")
+                
+                # Fallback path
+                if not start_url:
+                    try:
+                        start_url = self.generate_next_page_url(project_url, next_page, None)
+                        log_value("start_url_generated", start_url)
+                        logger.info(f"[URL] Fallback - generated URL for page {next_page}: {start_url}")
+                    except Exception as e:
+                        logger.error(f"[ERROR] Failed to generate next page URL: {str(e)}")
+                        raise
             
             # PROJECT COMPLETE: should not reach here (caught earlier)
             else:

@@ -13,8 +13,8 @@ export async function POST(request: NextRequest) {
     }
 
     // Allow 0 (unknown / not yet loaded total_pages)
-    const raw = pages ?? 0;
-    const n = typeof raw === 'number' ? raw : Number(raw);
+    const pagesRaw = pages ?? 0;
+    const n = typeof pagesRaw === 'number' ? pagesRaw : Number(pagesRaw);
     const pageCount = Number.isFinite(n) ? n : 0;
 
     // Call Python backend API to start monitoring
@@ -29,19 +29,32 @@ export async function POST(request: NextRequest) {
       body: JSON.stringify({
         run_token: runToken,
         pages: pageCount,
+        project_token: projectToken,
       }),
     });
 
+    const bodyText = await response.text();
+    let backendJson: { error?: string; session_id?: number } = {};
+    try {
+      backendJson = bodyText ? JSON.parse(bodyText) : {};
+    } catch {
+      backendJson = {};
+    }
+
     if (response.status !== 200) {
-      const error = await response.text();
-      console.error('Backend error:', error);
+      console.error('Backend error:', bodyText);
       return NextResponse.json(
-        { error: 'Failed to start monitoring on backend' },
+        {
+          error:
+            backendJson.error ||
+            bodyText ||
+            'Failed to start monitoring on backend',
+        },
         { status: response.status }
       );
     }
 
-    const data = await response.json();
+    const data = backendJson;
 
     return NextResponse.json({
       success: true,

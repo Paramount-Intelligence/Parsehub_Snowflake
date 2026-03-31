@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react'
 import Modal from './Modal'
 import { Activity, AlertCircle, CheckCircle2, Loader, Zap, AlertTriangle, Copy } from 'lucide-react'
 import apiClient from '@/lib/apiClient'
+import { normalizeCheckpointResponse } from '@/lib/scrapingApi'
 
 interface MetadataProgressModalProps {
   isOpen: boolean
@@ -12,6 +13,8 @@ interface MetadataProgressModalProps {
   projectTitle: string
   metadata?: any
   startingPage?: number
+  /** ParseHub run token for this scraping session (display only) */
+  runToken?: string
 }
 
 export default function MetadataProgressModal({
@@ -21,6 +24,7 @@ export default function MetadataProgressModal({
   projectTitle,
   metadata,
   startingPage = 1,
+  runToken,
 }: MetadataProgressModalProps) {
   const [checkpoint, setCheckpoint] = useState<any>(null)
   const [loading, setLoading] = useState(true)
@@ -31,29 +35,30 @@ export default function MetadataProgressModal({
 
   useEffect(() => {
     if (!isOpen) return
+    setLoading(true)
 
     const pollProgress = async () => {
       try {
-        setLoading(false)
         setError('')
 
-        // Get current checkpoint
+        // Get current checkpoint (unwrap { checkpoint: {...} } from Flask api_server)
         const cpRes = await apiClient.get(`/api/projects/${projectToken}/resume/checkpoint`)
-        const cp = cpRes.data
+        const cp = normalizeCheckpointResponse(cpRes.data)
 
         setCheckpoint(cp)
+        setLoading(false)
 
         // Calculate next URL based on pagination pattern
         if (metadata && cp) {
           const nextPage = cp.next_start_page || (cp.highest_successful_page || 0) + 1
-          const baseUrl = metadata.base_url || ''
+          const websiteUrl = metadata.website_url || ''
 
-          if (baseUrl.includes('?page=')) {
-            setNextUrl(baseUrl.replace(/page=\d+/, `page=${nextPage}`))
-          } else if (baseUrl.includes('?')) {
-            setNextUrl(`${baseUrl}&page=${nextPage}`)
-          } else if (baseUrl) {
-            setNextUrl(`${baseUrl}?page=${nextPage}`)
+          if (websiteUrl.includes('?page=')) {
+            setNextUrl(websiteUrl.replace(/page=\d+/, `page=${nextPage}`))
+          } else if (websiteUrl.includes('?')) {
+            setNextUrl(`${websiteUrl}&page=${nextPage}`)
+          } else if (websiteUrl) {
+            setNextUrl(`${websiteUrl}?page=${nextPage}`)
           }
 
           // Estimate records per page
@@ -67,24 +72,31 @@ export default function MetadataProgressModal({
         if (process.env.NODE_ENV === 'development') {
           console.error('Checkpoint error:', err)
         }
-        // Don't show error if just loading initially
-        if (!loading) setError(msg)
+        setError(msg)
       }
     }
 
     pollProgress()
-    const interval = setInterval(pollProgress, 3000)
+    const interval = setInterval(pollProgress, 10000)
     return () => clearInterval(interval)
-  }, [isOpen, projectToken, metadata, loading])
+  }, [isOpen, projectToken, metadata])
 
   const highestPage = checkpoint?.highest_successful_page || 0
   const nextPage = checkpoint?.next_start_page || startingPage
   const totalPages = metadata?.total_pages || 0
+  const totalProductsMeta = metadata?.total_products
   const totalRecords = checkpoint?.total_persisted_records || 0
   const progressPercent = totalPages > 0 ? (highestPage / totalPages) * 100 : 0
   const remainingPages = Math.max(0, totalPages - highestPage)
   const estimatedRemainingRecords = estimatedRecordsPerPage * remainingPages
-  const isComplete = highestPage >= totalPages && totalPages > 0
+  const isComplete =
+    Boolean(checkpoint?.is_project_complete) ||
+    (totalPages > 0 && highestPage >= totalPages)
+  const recordsBelowMeta =
+    typeof totalProductsMeta === "number" &&
+    totalProductsMeta > 0 &&
+    totalRecords < totalProductsMeta &&
+    isComplete
 
   const copyUrlToClipboard = () => {
     navigator.clipboard.writeText(nextUrl)
@@ -139,6 +151,44 @@ export default function MetadataProgressModal({
           </div>
         </div>
 
+        {/* Run + metadata targets */}
+        {(runToken || typeof totalProductsMeta === 'number') && (
+          <div className="flex flex-wrap gap-3 text-xs text-slate-400 border border-slate-700/80 rounded-lg p-3 bg-slate-900/40">
+            {runToken && (
+              <span>
+                <span className="text-slate-500">Run:</span>{' '}
+                <span className="font-mono text-slate-300">{runToken.slice(0, 14)}…</span>
+              </span>
+            )}
+            {typeof totalProductsMeta === 'number' && totalProductsMeta > 0 && (
+              <span>
+                <span className="text-slate-500">Metadata expected products:</span>{' '}
+                <span className="font-semibold text-slate-200">{totalProductsMeta.toLocaleString()}</span>
+              </span>
+            )}
+            {typeof totalProductsMeta === 'number' && totalProductsMeta > 0 && (
+              <span>
+                <span className="text-slate-500">Saved vs expected:</span>{' '}
+                <span
+                  className={
+                    totalRecords >= totalProductsMeta ? 'text-emerald-400' : 'text-amber-300'
+                  }
+                >
+                  {totalRecords.toLocaleString()} / {totalProductsMeta.toLocaleString()}
+                </span>
+              </span>
+            )}
+          </div>
+        )}
+
+        {recordsBelowMeta && (
+          <div className="bg-amber-900/20 border border-amber-600/50 rounded-lg p-3 text-xs text-amber-200">
+            All pages are processed, but saved record count is still below metadata{' '}
+            <strong>total_products</strong>. This can happen if listing density changed or metadata is
+            an estimate — verify in Snowflake <code className="text-amber-100">scraped_records</code>.
+          </div>
+        )}
+
         {/* Key Metrics */}
         <div className="grid grid-cols-3 gap-3">
           {/* Data Scraped */}
@@ -184,7 +234,7 @@ export default function MetadataProgressModal({
           </div>
           <div className="bg-slate-800/50 rounded p-2 border border-slate-600 overflow-x-auto">
             <p className="text-xs font-mono text-blue-300 break-all whitespace-pre-wrap">
-              {nextUrl || `${metadata?.base_url || 'Loading...'}?page=${nextPage}`}
+              {nextUrl || `${metadata?.website_url || 'Loading...'}?page=${nextPage}`}
             </p>
           </div>
           <p className="text-xs text-slate-500">

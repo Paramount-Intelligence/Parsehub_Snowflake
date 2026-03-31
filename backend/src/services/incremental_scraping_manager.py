@@ -35,7 +35,6 @@ if str(root_dir) not in sys.path:
     sys.path.insert(0, str(root_dir))
 
 from src.models.database import ParseHubDatabase
-from src.services.chunk_pagination_orchestrator import ChunkPaginationOrchestrator
 from src.services.metadata_driven_resume_scraper import get_metadata_driven_scraper
 
 load_dotenv('.env')
@@ -77,7 +76,6 @@ class IncrementalScrapingManager:
     
     def __init__(self):
         self.db = ParseHubDatabase()
-        self.orchestrator = ChunkPaginationOrchestrator()
 
         self.api_key = os.getenv('PARSEHUB_API_KEY')
         if not self.api_key:
@@ -208,17 +206,10 @@ class IncrementalScrapingManager:
                     )
                     print(f"  Remaining pages to scrape: {remaining_pages}")
 
-                    # Trigger the run
-                    result = self.trigger_continuation_run(
-                        project_token=project_token,
-                        project_id=project_id,
-                        start_page=next_page,
-                        total_pages=total_pages,
-                        pages_to_scrape=remaining_pages,
-                        project_name=project_name
-                    )
+                    # Trigger the run using the robust scraper which correctly targets next_page_url
+                    result = scraper.resume_or_start_scraping(project_id, project_token)
 
-                    if result['success']:
+                    if result.get('success'):
                         continuation_results.append({
                             'project_id': project_id,
                             'project_name': project_name,
@@ -230,7 +221,7 @@ class IncrementalScrapingManager:
                         print(f"[OK] Run scheduled successfully")
                     else:
                         print(
-                            f"[ERROR] Failed to schedule run: {result.get('error', 'Unknown error')}")
+                            f"[ERROR] Failed to schedule run: {result.get('error', result.get('message', 'Unknown error'))}")
                 else:
                     print(
                         f"[OK] Project is complete (all {total_pages} pages scraped)")

@@ -148,8 +148,13 @@ export default function RunDialog({
     }
   };
 
-  const canResume = checkpoint && checkpoint.highest_successful_page > 0 && !checkpoint?.is_project_complete;
-  const isComplete = checkpoint?.is_project_complete;
+  const totalPagesMeta = metadata?.total_pages ?? 0
+  const highestPage = checkpoint?.highest_successful_page ?? 0
+  const pagesComplete =
+    totalPagesMeta > 0 && highestPage >= totalPagesMeta
+  const isComplete =
+    Boolean(checkpoint?.is_project_complete) || pagesComplete
+  const canResume = checkpoint && highestPage > 0 && !isComplete
 
   return (
     <>
@@ -201,10 +206,10 @@ export default function RunDialog({
                         <span className="font-semibold text-slate-200">{metadata.total_products.toLocaleString()}</span>
                       </div>
                     )}
-                    {metadata.base_url && (
+                    {metadata.website_url && (
                       <div className="flex justify-between items-start gap-2">
-                        <span className="text-slate-400">Base URL:</span>
-                        <span className="font-mono text-xs text-blue-300 text-right break-all">{metadata.base_url}</span>
+                        <span className="text-slate-400">Website URL:</span>
+                        <span className="font-mono text-xs text-blue-300 text-right break-all">{metadata.website_url}</span>
                       </div>
                     )}
                   </div>
@@ -241,15 +246,30 @@ export default function RunDialog({
                         Next Page to Scrape:
                       </span>
                       <span className="font-semibold text-blue-300">
-                        Page {checkpoint.next_page_to_scrape || 1}
+                        Page {checkpoint.next_start_page ?? 1}
                       </span>
                     </div>
 
-                    {checkpoint.total_records_persisted !== undefined && (
+                    {metadata?.total_pages != null && (
+                      <div className="flex justify-between items-center">
+                        <span className="text-slate-400">Pages (metadata):</span>
+                        <span className="font-semibold text-slate-200">
+                          {highestPage} / {metadata.total_pages}
+                        </span>
+                      </div>
+                    )}
+
+                    {checkpoint.total_persisted_records !== undefined && (
                       <div className="flex justify-between items-center">
                         <span className="text-slate-400">Records Saved:</span>
                         <span className="font-semibold text-slate-200">
-                          {checkpoint.total_records_persisted.toLocaleString()}
+                          {checkpoint.total_persisted_records.toLocaleString()}
+                          {metadata?.total_products != null && (
+                            <span className="text-slate-500 font-normal">
+                              {" "}
+                              / {metadata.total_products.toLocaleString()} expected
+                            </span>
+                          )}
                         </span>
                       </div>
                     )}

@@ -13,23 +13,33 @@ describe('Type Definitions', () => {
   describe('ProjectMetadata', () => {
     it('should define project metadata structure', () => {
       const metadata: ProjectMetadata = {
+        project_id: 1,
+        project_name: 'Test',
+        website_url: 'https://shop.com/items?page=1',
         base_url: 'https://shop.com/items?page=1',
         total_pages: 50,
         total_products: 2500,
+        current_page_scraped: 0,
       }
 
+      expect(metadata.website_url).toBeDefined()
       expect(metadata.base_url).toBeDefined()
       expect(metadata.total_pages).toBe(50)
       expect(metadata.total_products).toBe(2500)
     })
 
-    it('should allow optional total_products', () => {
+    it('should allow zero total_products', () => {
       const metadata: ProjectMetadata = {
+        project_id: 2,
+        project_name: 'T2',
+        website_url: 'https://shop.com/items?page=1',
         base_url: 'https://shop.com/items?page=1',
         total_pages: 100,
+        total_products: 0,
+        current_page_scraped: 0,
       }
 
-      expect(metadata.total_products).toBeUndefined()
+      expect(metadata.total_products).toBe(0)
     })
   })
 
@@ -62,19 +72,21 @@ describe('Type Definitions', () => {
   describe('ProjectProgress', () => {
     it('should combine metadata with checkpoint and progress info', () => {
       const progress: ProjectProgress = {
-        metadata: {
-          base_url: 'https://shop.com/items?page=1',
-          total_pages: 50,
-          total_products: 2500,
-        },
+        project_id: 1,
+        project_name: 'P',
+        highest_successful_page: 5,
+        next_start_page: 6,
+        total_pages: 50,
+        total_products: 2500,
+        total_persisted_records: 125,
+        is_complete: false,
+        progress_percentage: 10,
         checkpoint: {
           highest_successful_page: 5,
           next_start_page: 6,
           total_persisted_records: 125,
           checkpoint_timestamp: '2024-03-26T14:30:00Z',
         },
-        is_complete: false,
-        progress_percentage: 10,
       }
 
       expect(progress.progress_percentage).toBe(10)
@@ -83,19 +95,21 @@ describe('Type Definitions', () => {
 
     it('should show 100% progress when complete', () => {
       const progress: ProjectProgress = {
-        metadata: {
-          base_url: 'https://shop.com/items?page=1',
-          total_pages: 50,
-          total_products: 2500,
-        },
+        project_id: 1,
+        project_name: 'P',
+        highest_successful_page: 50,
+        next_start_page: 51,
+        total_pages: 50,
+        total_products: 2500,
+        total_persisted_records: 2500,
+        is_complete: true,
+        progress_percentage: 100,
         checkpoint: {
           highest_successful_page: 50,
           next_start_page: 51,
           total_persisted_records: 2500,
           checkpoint_timestamp: '2024-03-26T14:30:00Z',
         },
-        is_complete: true,
-        progress_percentage: 100,
       }
 
       expect(progress.progress_percentage).toBe(100)

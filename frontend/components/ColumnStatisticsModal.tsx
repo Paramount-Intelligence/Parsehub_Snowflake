@@ -6,6 +6,8 @@ import { useState, useEffect } from "react";
 import { Download, BarChart3 } from "lucide-react";
 import Modal from "./Modal";
 
+const ANALYTICS_FETCH_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes (same as CSVDataModal)
+
 interface ColumnStatisticsModalProps {
   token: string;
   title: string;
@@ -41,7 +43,10 @@ export default function ColumnStatisticsModal({
     setError(null);
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 120000);
+      const timeoutId = setTimeout(
+        () => controller.abort(),
+        ANALYTICS_FETCH_TIMEOUT_MS,
+      );
 
       try {
         const response = await fetch(
@@ -80,7 +85,9 @@ export default function ColumnStatisticsModal({
       }
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") {
-        setError("Request timed out (took longer than 120 seconds). The dataset might be too large.");
+        setError(
+          "Request timed out (took longer than 5 minutes). The dataset might be too large.",
+        );
       } else {
         setError(err instanceof Error ? err.message : "Failed to fetch data");
       }

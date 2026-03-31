@@ -13,6 +13,9 @@
 export interface ProjectMetadata {
   project_id: number
   project_name: string
+  /** Canonical listing URL for pagination (matches backend metadata.website_url) */
+  website_url: string
+  /** Alias for website_url — kept for older UI/tests */
   base_url: string
   total_pages: number
   total_products: number
@@ -24,6 +27,8 @@ export interface ScrapingCheckpoint {
   next_start_page: number
   total_persisted_records: number
   checkpoint_timestamp: string
+  /** Set when API includes completion flag; otherwise derive from metadata + pages */
+  is_project_complete?: boolean
 }
 
 export interface ProjectProgress {

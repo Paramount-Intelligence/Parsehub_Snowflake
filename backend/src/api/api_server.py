@@ -36,6 +36,7 @@ from src.services.analytics_service import AnalyticsService
 from src.services.excel_import_service import ExcelImportService
 from src.services.auto_runner_service import AutoRunnerService
 from src.services.group_run_service import GroupRunService
+from src.services.analytics_sync_worker import start_analytics_sync_job
 from src.services.msa_project_sync_service import sync_msa_projects
 from src.api.fetch_projects import fetch_all_projects, get_all_projects_with_cache
 from src.services.incremental_scraping_scheduler import start_incremental_scraping_scheduler, stop_incremental_scraping_scheduler
@@ -131,6 +132,12 @@ def _initialize_services():
             _auto_runner_service  = AutoRunnerService()
             _group_run_service    = GroupRunService(_db)
             _auto_complete_service = AutoCompleteService()
+
+            # Start 5-minute background analytics fetcher
+            try:
+                start_analytics_sync_job()
+            except Exception as e:
+                logger.error(f"[boot] Analytics sync worker failed to start: {e}")
 
             # Link scraper to auto-complete service for resume capability
             from src.services.metadata_driven_resume_scraper import get_metadata_driven_scraper
@@ -2275,7 +2282,30 @@ def get_analytics():
             result = g.db.get_analytics_data(project_token)
             
             if result:
-                records_count = len(result.get('raw_data', []))
+                raw_data = result.get('raw_data', [])
+                if raw_data:
+                    # 1. Compute stable union of keys
+                    keys_set = set()
+                    for r in raw_data:
+                        if isinstance(r, dict):
+                            keys_set.update(r.keys())
+                    columns = sorted(list(keys_set))
+                    
+                    # 2. Normalize rows against the stable columns array
+                    normalized_rows = []
+                    for r in raw_data:
+                        if isinstance(r, dict):
+                            normalized_rows.append({col: r.get(col, "") for col in columns})
+                        else:
+                            normalized_rows.append({col: "" for col in columns})
+                else:
+                    columns = []
+                    normalized_rows = []
+
+                result['columns'] = columns
+                result['rows'] = normalized_rows
+                
+                records_count = len(normalized_rows)
                 logger.info(f'[GET-ANALYTICS] ✅ Found data with {records_count} records for {project_token}')
                 return jsonify({
                     'success': True,

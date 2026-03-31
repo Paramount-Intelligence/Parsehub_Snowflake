@@ -87,11 +87,15 @@ export function useRealTimeMonitoring(): UseRealTimeMonitoringReturn {
           }),
         });
 
-        if (!response.ok) {
-          throw new Error('Failed to start monitoring');
-        }
+        const result = await response.json().catch(() => ({}));
 
-        const result = await response.json();
+        if (!response.ok) {
+          const detail =
+            typeof result.error === 'string'
+              ? result.error
+              : `Failed to start monitoring (${response.status})`;
+          throw new Error(detail);
+        }
 
         if (!result.success && !result.sessionId) {
           throw new Error(result.error || 'Failed to start monitoring');

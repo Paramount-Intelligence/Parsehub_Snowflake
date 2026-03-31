@@ -6,7 +6,7 @@ import {
   getCheckpoint,
   getProjectMetadata,
   startBatchScrapingLegacy,
-} from '../scrapingApi'
+} from '../lib/scrapingApi'
 
 describe('scrapingApi', () => {
   beforeEach(() => {
@@ -160,15 +160,13 @@ describe('scrapingApi', () => {
         success: true,
         project_id: 123,
         project_name: 'Test Store',
-        project_metadata: {
-          base_url: 'https://shop.com/items?page=1',
-          total_pages: 50,
-          total_products: 2500,
-        },
+        total_pages: 50,
+        total_products: 2500,
         checkpoint: {
           highest_successful_page: 5,
           next_start_page: 6,
           total_persisted_records: 125,
+          checkpoint_timestamp: '2024-03-26T14:30:00Z',
         },
         is_complete: false,
         progress_percentage: 10,
@@ -181,7 +179,7 @@ describe('scrapingApi', () => {
 
       const result = await getProjectProgress('token_xyz')
       
-      expect(result.project_metadata.total_pages).toBe(50)
+      expect(result.total_pages).toBe(50)
       expect(result.checkpoint.highest_successful_page).toBe(5)
       expect(result.progress_percentage).toBe(10)
       expect(result.is_complete).toBe(false)
@@ -190,11 +188,16 @@ describe('scrapingApi', () => {
     it('should show 100% progress when all pages scraped', async () => {
       const mockResponse = {
         success: true,
-        project_metadata: {
-          total_pages: 50,
-        },
+        project_id: 1,
+        project_name: 'P',
+        total_pages: 50,
+        total_products: 2500,
+        total_persisted_records: 2500,
         checkpoint: {
           highest_successful_page: 50,
+          next_start_page: 51,
+          total_persisted_records: 2500,
+          checkpoint_timestamp: '2024-03-26T14:30:00Z',
         },
         is_complete: true,
         progress_percentage: 100,
@@ -234,9 +237,9 @@ describe('scrapingApi', () => {
 
       const result = await getCheckpoint('token_xyz')
       
-      expect(result.checkpoint.highest_successful_page).toBe(8)
-      expect(result.checkpoint.next_start_page).toBe(9)
-      expect(result.progress_percentage).toBe(16)
+      expect(result.highest_successful_page).toBe(8)
+      expect(result.next_start_page).toBe(9)
+      expect(result.total_persisted_records).toBe(200)
     })
   })
 
@@ -245,10 +248,14 @@ describe('scrapingApi', () => {
     it('should return project metadata', async () => {
       const mockResponse = {
         success: true,
-        project_metadata: {
+        metadata: {
+          project_id: 1,
+          project_name: 'E-commerce Store',
+          website_url: 'https://shop.com/items?page=1',
           base_url: 'https://shop.com/items?page=1',
           total_pages: 50,
           total_products: 2500,
+          current_page_scraped: 0,
         },
         project_name: 'E-commerce Store',
       }
@@ -260,6 +267,7 @@ describe('scrapingApi', () => {
 
       const result = await getProjectMetadata('token_xyz')
       
+      expect(result.website_url).toContain('page=1')
       expect(result.base_url).toContain('page=1')
       expect(result.total_products).toBe(2500)
     })
